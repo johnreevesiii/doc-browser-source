@@ -7,7 +7,11 @@ the two cores the page serves.
 
 The player brings their own game files. This repository contains no game data
 and nothing derived from it: no ROM or BIOS bytes, dumps, extracted assets,
-screenshots, traces, cards or saves.
+screenshots, traces, cards or saves. One exception, approved by John R Reeves
+III for this recipe only: `host/src/edition-b-spec.js`, the recipe the page
+uses to build the Rev C Rebalanced edition from the player's own stock game
+file, holds two SHA-256 checks (the stock program it accepts and the program
+it must produce) so the page can refuse any other file. It holds no game bytes.
 
 ## Layout
 

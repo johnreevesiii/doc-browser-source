@@ -175,9 +175,13 @@ export class RestartRefusedError extends Error {
   }
 }
 
+// Player-facing edition names (doc-ops D-072; the same as edition-b.js EDITION_NAMES).
+const EDITION_LABEL = Object.freeze({ A: 'Rev C', B: 'Rev C Rebalanced' });
+const editionLabel = (e) => EDITION_LABEL[e] || 'another edition';
+
 export class EditionMismatchError extends Error {
   constructor(want, got) {
-    super(`This horse is Edition ${got}, and this game is Edition ${want}. Editions never mix.`);
+    super(`This horse plays in ${editionLabel(got)}, and this game is ${editionLabel(want)}. Editions never mix.`);
     this.name = 'EditionMismatchError';
     this.want = want;
     this.got = got;

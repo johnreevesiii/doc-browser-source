@@ -24,8 +24,10 @@ The page needs cross-origin isolation (COOP `same-origin`, COEP
 
 | Folder | Contents |
 |---|---|
-| `src/` | Page modules: game file store and setup check, input, audio, video, core bridge, card store and the stable card source, the five-board linked cabinet (`lb-*.js`, `cabinet-game.js`) |
+| `src/` | Page modules: game file store and setup check, input, audio, video, core bridge, card store and the stable card source, the linked cabinet (`lb-*.js`, `cabinet-game.js`; four seats on the served page), and the Rev C Rebalanced build (`edition-b.js` with its recipe `edition-b-spec.js`: the edition is built in the player's browser from the player's own stock game file) |
 | `shim/` | C/C++ linked into the cores: the libretro front end (`libretro_shim.c`), core options, debug state reads, and the LinkBus glue for the five-board core |
 
 The player supplies the game files, which stay in the browser. Nothing here
-contains or is derived from game data.
+contains game data. The one item derived from it is in `src/edition-b-spec.js`:
+two SHA-256 checks, of the stock program the build accepts and of the program
+it must produce (approved by John R Reeves III for this recipe only).

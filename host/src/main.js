@@ -10,9 +10,10 @@ import { startPage, pageMode, isPilotBuild } from './page-start.js';
 import { createCardStore, createLocalLabCardSource, checkCardName, checkCardSize } from './card-store.js';
 import { takeHandoff, createStableCardSource, MESSAGES as STABLE_MESSAGES, EditionMismatchError, CardUnavailableError, DEFAULT_RETURN_PATH } from './card-stable.js';
 import { loadMix, saveMix, toPercent } from './audio-mix.js';
-import { verifySetup, editionProblem, SETUP_MESSAGES, BUILDABLE_EDITIONS } from './rom-setup.js';
+import { verifySetup, editionProblem, pageEdition, SETUP_MESSAGES } from './rom-setup.js';
+import { editionFiles, linkTags, EditionImageError, EditionBrowserError, editionBrowserProblem, EDITION_NAMES, EDITION_MESSAGES } from './edition-b.js';
 import { createTokenProvider } from './stable-auth.js';
-import { startStableCabinet, openCabinetAudio, BOARD_LABELS, PLAYER_BOARD } from './cabinet-game.js';
+import { startStableCabinet, openCabinetAudio, boardLabels, playerPageSeats, PLAYER_BOARD } from './cabinet-game.js';
 import { collectFacts, sendFeedback, pageVersionFrom, FEEDBACK_MESSAGES } from './pilot-feedback.js';
 import {
   ACTIONS, loadBindings, saveBindings, clearBindings, defaultBindings, isDefault, toKeyboardMap, toGamepadMap,
@@ -420,6 +421,10 @@ function mountControls() {
 // a race needs the master, so one board alone sits at NO LINK. ?board=single
 // keeps the single-board page for diagnostics.
 const CABINET = new URLSearchParams(location.search).get('board') !== 'single';
+// ?seats=8: the eight-seat cabinet (linkbus/EIGHT_SEATS.md), nine linked
+// boards plus the graphics partner in this page; lab only (a loopback
+// server, playerPageSeats). Everywhere else four seats.
+const CABINET_SEATS = playerPageSeats(location.search, location.hostname);
 let cab = null;
 
 // The connection notice over the game ('' hides it).
@@ -445,7 +450,25 @@ function pauseOnLoss(msg) {
 }
 
 function cabinetCanvases() {
-  return BOARD_LABELS.map((label) => $(`cab-${label}`));
+  return boardLabels(CABINET_SEATS).map((label) => $(`cab-${label}`) || extraSeatCanvas(label));
+}
+
+// Eight seats: seats 5 to 8 get a canvas under "Other seats", next to the
+// page's seats 2 to 4 (index.html), made once.
+function extraSeatCanvas(label) {
+  const box = document.querySelector('#cab-info .boards');
+  const m = /^board(\d+)$/.exec(label);
+  if (!box || !m) return null;
+  const fig = document.createElement('figure');
+  const c = document.createElement('canvas');
+  c.id = `cab-${label}`;
+  c.width = 640;
+  c.height = 480;
+  const cap = document.createElement('figcaption');
+  cap.textContent = `Seat ${m[1]} (no card)`;
+  fig.append(c, cap);
+  box.append(fig);
+  return c;
 }
 
 // The cabinet sound's state for the note (pilot-feedback.js soundFacts).
@@ -471,13 +494,15 @@ async function stableMode() {
   sp.panel.hidden = false;
   sp.back.href = handoff.return_path;
   sp.horse.textContent = handoff.horse_name || 'Your horse';
-  sp.edition.textContent = `Edition ${handoff.edition}`;
+  sp.edition.textContent = EDITION_NAMES[handoff.edition] || `Edition ${handoff.edition}`;
   say('');
   const getAuthToken = await createTokenProvider();
-  // The edition this build runs, never the hand-off's own claim: a horse of
-  // another edition is refused before any card byte is fetched.
+  // The edition this page runs (rom-setup.js pageEdition): the server's own
+  // record of the horse's edition must match it at every checkout, so a
+  // horse of the other edition is refused before any card byte is used.
+  const edition = pageEdition(handoff);
   const source = createStableCardSource({
-    handoff, getAuthToken, expectEdition: BUILDABLE_EDITIONS[0],
+    handoff, getAuthToken, expectEdition: edition,
     onEvent: (e) => {
       stableSay(e.message);
       if (e.type === 'lost' || e.type === 'held' || e.type === 'signin' || e.type === 'error' || e.type === 'rejected') noteError(e.message);
@@ -511,6 +536,33 @@ async function stableMode() {
   if (!check.ok) { await refuse(SETUP_MESSAGES[check.reason]); return; }
   const why = editionProblem(handoff.edition, check.setup);
   if (why) { await refuse(SETUP_MESSAGES[why]); return; }
+  // Edition B (Rev C Rebalanced) is built here, in memory, from the stock
+  // set on this device, and checked against the reviewed pins; a file that
+  // is not the stock set is refused before Start. The built game file stays
+  // in page memory for this game only. The link tags carry the edition and
+  // the hash of the image the boards run (edition-b.js linkTags).
+  let builtGame = null;
+  let joinHash = check.setup.files.find((f) => f.role === 'game').sha256;
+  if (edition === 'B') {
+    // A browser that can't build B is told so, never that his files are wrong (EditionBrowserError).
+    if (editionBrowserProblem()) { await refuse(EDITION_MESSAGES.browser); return; }
+    stableSay(EDITION_MESSAGES.build);
+    try {
+      const built = await editionFiles({ edition, setup: { files: check.setup.files.filter((f) => f.role === 'game') }, read: (name) => store.read(name) });
+      builtGame = built.files[0][1];
+      joinHash = built.joinHash;
+    } catch (err) {
+      await refuse(err instanceof EditionBrowserError ? EDITION_MESSAGES.browser
+        : err instanceof EditionImageError ? EDITION_MESSAGES.refused : STABLE_MESSAGES.error);
+      return;
+    }
+  }
+  const link = linkTags(edition, joinHash);
+  // For tests and the pilot console: which edition this page runs and the link's edition tag (no hash).
+  window.__docEdition = Object.freeze({ edition, link: link.edition });
+  // The files the boards run, read when the game starts: the built game file
+  // for B (a fresh copy each time), the stored files otherwise.
+  const readGameFile = async (f) => (builtGame && f.role === 'game' ? builtGame.slice() : store.read(f.name));
   if (source.state() !== 'new') return; // the lease ended while checking
   stableSay(`Ready. Press Start, then press ${cardKey()} in the game to insert your horse card.`);
   sp.start.hidden = false;
@@ -521,7 +573,7 @@ async function stableMode() {
       const factory = await loadCoreFactory();
       if (!factory) { await refuse('The game is not available on this site yet.'); return; }
       const files = [];
-      for (const f of check.setup.files) files.push([f.name, await store.read(f.name)]);
+      for (const f of check.setup.files) files.push([f.name, await readGameFile(f)]);
       stableSay('Starting the game.');
       host = await startCore({
         factory, canvas, files, game: check.game, options: createCoreOptions(), input,
@@ -552,7 +604,7 @@ async function stableMode() {
       // Lost while waiting: startStableCabinet refuses (LeaseLostError) and
       // the catch below closes the sound and says why.
       cabSound = audio;
-      stableSay(`Starting the cabinet: five boards boot together. This takes about half a minute. Then press ${cardKey()} to insert your horse card.`);
+      stableSay(`Starting the cabinet: ${CABINET_SEATS === 8 ? 'nine' : 'five'} boards boot together. This takes about half a minute. Then press ${cardKey()} to insert your horse card.`);
       cab = launchCabinet(files, card);
       files.length = 0;
       window.__docCabinet = cab;
@@ -568,12 +620,12 @@ async function stableMode() {
 
   async function readCabinetFiles() {
     const files = [];
-    for (const f of check.setup.files) files.push([f.name, (await store.read(f.name)).buffer]);
+    for (const f of check.setup.files) files.push([f.name, (await readGameFile(f)).buffer]);
     return files;
   }
   function launchCabinet(files, card) {
     return startStableCabinet({
-      files, game: check.game, card, input, canvases: cabinetCanvases(), source, audio: cabSound,
+      files, game: check.game, card, input, canvases: cabinetCanvases(), seats: CABINET_SEATS, source, audio: cabSound, link,
       onStats: showCabinetStats,
       onFailure: (why) => { console.error(`[cabinet] ${why}`); noteError(`cabinet: ${why}`); stableSay('The cabinet stopped with an error. Your last saved card is safe in your stable. Press Restart cabinet to try again, or return to your stable.'); showBack(); },
       log: (t) => console.log(t),

@@ -1,7 +1,8 @@
-// cabinet-game.js: a stable game on the single-page five-board cabinet
+// cabinet-game.js: a stable game on the single-page linked cabinet
 // (doc-wasm/linkbus2). The player's horse races on satellite 1 (board1) of
 // a linked cabinet: the master (board0) runs the race, board1 to board4 are
-// the four seats, and the master's graphics partner runs beside it. One
+// the four seats (board1 to board8 with seats: 8, linkbus/EIGHT_SEATS.md),
+// and the master's graphics partner runs beside it. One
 // race needs the master, so a lone board would sit at NO LINK.
 // Copyright (C) 2026 John R Reeves III
 // SPDX-License-Identifier: GPL-2.0-or-later
@@ -10,7 +11,7 @@
 //   writes come back from the board worker in game order and go to
 //   source.write; no other seat has a card or can write one.
 // - Input: the player's keyboard and gamepad reach board1 only, through a
-//   shared Int32 word per port. Seats 2 to 4 have no card and no input, as
+//   shared Int32 word per port. The other seats have no card and no input, as
 //   in the lab's linked race; the master and partner have no input either.
 // - Audio: the player's seat (seat sounds) and the race screen boards, board0
 //   and its partner (race audio), each through a shared ring and an
@@ -27,13 +28,25 @@
 //   recorded as no result. See raceEntrySignal.
 // No network code: the game files come in as bytes the page already read.
 
-import { startCabinet, BOARDS } from './lb-cabinet.js';
+import { startCabinet, cabinetBoards, isLinkedStatus } from './lb-cabinet.js';
 import { LeaseLostError } from './card-stable.js';
 import { createAudioOutput } from './audio-output.js';
 
 export const PLAYER_BOARD = 'board1';
 export const CABINET_PACE_HZ = 60;
-export const BOARD_LABELS = Object.freeze(BOARDS.map((b) => b.label));
+// Board labels in board table order (the page's canvases follow it).
+export const boardLabels = (seats = 4) => Object.freeze(cabinetBoards(seats).map((b) => b.label));
+export const BOARD_LABELS = boardLabels(4);
+
+// The player page's seat count. Four, except ?seats=8 on a loopback lab
+// server (tools/serve.mjs binds 127.0.0.1): until an eight-seat game has
+// been run on the player page, no other URL (the pilot included) can turn
+// eight seats on.
+const LAB_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]', '::1']);
+export function playerPageSeats(search, hostname) {
+  const asked = new URLSearchParams(search || '').get('seats');
+  return asked === '8' && LAB_HOSTS.has(String(hostname || '').toLowerCase()) ? 8 : 4;
+}
 
 // Race entry, from the watched words (lb-board-worker.js WATCH, Rev C).
 // Source: doc-ops research/claude/a04-link-timing/boundary/CLAIM.md K1 (a
@@ -152,10 +165,14 @@ export function cabinetAudioBoards(audio) {
 }
 
 // startStableCabinet({ files, game, card, input, canvases, source, audio,
-//   say, onStats, onFailure }): files = [[name, ArrayBuffer]] read once from
-// OPFS; card = the Uint8Array from source.insert(); canvases = six canvas
-// elements in BOARDS order. Returns { cabinet, inRace(), checkRace(), finish(), stop() }.
-export function startStableCabinet({ files, game, card, input, canvases, source, audio = null, say = () => {}, onStats = () => {}, onFailure = () => {}, log = () => {} }) {
+//   say, onStats, onFailure, seats, link }): files = [[name, ArrayBuffer]] read
+// once from OPFS (for Edition B the game file is the image built in memory,
+// edition-b.js); card = the Uint8Array from source.insert(); canvases = one
+// canvas element per board in boardLabels(seats) order (seats 4, the default,
+// or 8; a missing seat canvas is drawn nowhere); link = { edition, sessionTag }
+// from edition-b.js linkTags (default: the lab's Edition A tags). Returns
+// { cabinet, inRace(), checkRace(), finish(), stop() }.
+export function startStableCabinet({ files, game, card, input, canvases, source, seats = 4, audio = null, link = null, say = () => {}, onStats = () => {}, onFailure = () => {}, log = () => {} }) {
   // The session can end while the page waits (the checkout, the sound): a
   // lost session never starts a cabinet that could not save.
   if (source && typeof source.state === 'function' && source.state() !== 'ready') {
@@ -180,8 +197,9 @@ export function startStableCabinet({ files, game, card, input, canvases, source,
     failed = true;
     onFailure(why);
   };
+  const boards = cabinetBoards(seats);
   const cabinet = startCabinet({
-    files, game, canvases,
+    files, game, canvases, seats,
     frames: 2e9, hashEvery: 300,
     pinTime: Math.floor(Date.now() / 1000), jitDet: 1, bank: 'snapshot', dynarec: 1,
     paceHz: CABINET_PACE_HZ, barrierTimeoutMs: 10000,
@@ -190,6 +208,7 @@ export function startStableCabinet({ files, game, card, input, canvases, source,
     onCardWrite: cardWriteHandler({ isRunning: () => running, source, log }),
     input: inputSab, inputBoard: PLAYER_BOARD,
     audioBoards: cabinetAudioBoards(audio),
+    ...(link ? { edition: link.edition, sessionTag: link.sessionTag } : {}),
     log,
     onEvent: (label, m) => {
       if (m.type === 'error') fail(`${label}: ${m.message}`);
@@ -199,8 +218,8 @@ export function startStableCabinet({ files, game, card, input, canvases, source,
 
   // Status once a second: guest vblanks per second on the player's seat,
   // the link state of that seat, and the race phase from the master.
-  const seat = BOARDS.findIndex((b) => b.label === PLAYER_BOARD);
-  const ring = BOARDS[seat].seat;
+  const seat = boards.findIndex((b) => b.label === PLAYER_BOARD);
+  const ring = boards[seat].seat;
   let lastV = 0;
   let lastT = performance.now();
   const race = createRaceTracker();
@@ -226,7 +245,7 @@ export function startStableCabinet({ files, game, card, input, canvases, source,
     checkRace();
     onStats({
       fps, vblanks: v, loaded, boards: st.boards.length,
-      linked: !!(last && /^04/.test(last.comm2)),
+      linked: !!(last && isLinkedStatus(last.comm2, seats)),
       phase, scene, inRace: race.inRace(),
       hub: cabinet.hubStatus(),
     });

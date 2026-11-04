@@ -26,10 +26,30 @@ import { ROM_DIR_NAME, checkRomName } from './rom-store.js';
 export const SETUP_FILE = 'doc-setup.json';
 const HEX64 = /^[0-9a-f]{64}$/;
 
-// Editions this build of the game can run. Edition B is built in the
-// player's browser from the patch specs (PLAN_V2 2.7), which is not built
-// yet, so only A runs today. Editions never mix (D-059, D-062).
-export const BUILDABLE_EDITIONS = Object.freeze(['A']);
+// Editions this build of the game can run. Edition A is the stock Rev C
+// set as stored. Edition B ("Rev C Rebalanced", doc-ops D-072) is built in
+// the player's browser from that same stock set (edition-b.js), so a device
+// set up for A can run B too; the build itself refuses any file that is not
+// the stock set. Editions never mix (D-059, D-062).
+export const BUILDABLE_EDITIONS = Object.freeze(['A', 'B']);
+
+// The editions a device's stored game file can run. B is only ever built
+// in this browser from the stock set (D-072: never from a prebuilt B file),
+// so a record that holds the stock set (A) runs both, and any other record
+// runs neither.
+export function deviceEditions(setup) {
+  const own = setup && Array.isArray(setup.editions) ? setup.editions : [];
+  return own.includes('A') ? ['A', 'B'] : [];
+}
+
+// The edition this page runs for a hand-off: the hand-off's edition when
+// this build can run it, else the first buildable one (and the card source
+// then refuses the horse as the other edition). The server's own record of
+// the horse's edition is checked against this at every checkout.
+export function pageEdition(handoff) {
+  const e = handoff && handoff.edition;
+  return BUILDABLE_EDITIONS.includes(e) ? e : BUILDABLE_EDITIONS[0];
+}
 
 export function parseSetup(raw) {
   let r;
@@ -99,13 +119,13 @@ export async function verifySetup({ getRoot = defaultGetRoot, subtle, expected =
 /** Why this device can't run a horse of `edition` (null = it can). */
 export function editionProblem(edition, setup) {
   if (!BUILDABLE_EDITIONS.includes(edition)) return 'not-built';
-  if (!setup || !setup.editions.includes(edition)) return 'not-set-up';
+  if (!setup || !deviceEditions(setup).includes(edition)) return 'not-set-up';
   return null;
 }
 
 export const SETUP_MESSAGES = Object.freeze({
   missing: 'This device has no game files set up yet. Go back to your stable and set up your game files first.',
   changed: 'The game files on this device changed since they were checked. Go back to your stable and set them up again.',
-  'not-built': 'This horse is Edition B, which the browser game cannot run yet. Editions never mix, so it stays in your stable for now.',
-  'not-set-up': 'The game files on this device are for the other edition. Editions never mix. Go back to your stable and set up the right files.',
+  'not-built': 'The browser game cannot run the edition of this horse yet. Editions never mix, so it stays in your stable for now.',
+  'not-set-up': 'The game files on this device are not for the edition of this horse. Editions never mix. Go back to your stable and set up the right files.',
 });

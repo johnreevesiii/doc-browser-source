@@ -4,7 +4,7 @@
 // Copyright (C) 2026 John R Reeves III
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
-// init message: { n, mailboxes: [SharedArrayBuffer], sessionTag, edition,
+// init message: { n (ring nodes: 5 for four seats, 9 for eight), mailboxes: [SharedArrayBuffer], sessionTag, edition,
 //   status: SharedArrayBuffer (Int32 HUB_STATUS words), ctl: SharedArrayBuffer
 //   (Int32: [0] stop, [1] pacing period in microseconds, 0 = unpaced,
 //   [2] catch-up limit in ms, 0 = 250),
@@ -30,14 +30,12 @@
 // stretch costs real time once and never comes back as a burst. Guest time
 // is unaffected: it counts rounds, not milliseconds.
 
-import { createLockstepHub, mailboxViews, readTx, deliver, MB } from './lb-lockstep.js';
+import { createLockstepHub, mailboxViews, readTx, deliver, MB, HUB_STATUS } from './lb-lockstep.js';
 
-export const HUB_STATUS = Object.freeze({
-  round: 0, waitingSeat: 1, running: 2, emptyRounds: 3, overruns: 4, busyMs: 5, lateResets: 6, lateMs: 7,
-  txSeq: 8, refused: 16, sizeMismatch: 24, unsized: 32, words: 64,
-});
+export { HUB_STATUS };
 
 function run({ n, mailboxes, sessionTag, edition, status, ctl }) {
+  if (!(n >= 2 && n <= HUB_STATUS.maxNodes)) throw new Error(`ring of ${n} nodes: the status words hold at most ${HUB_STATUS.maxNodes}`);
   const st = new Int32Array(status);
   const c = new Int32Array(ctl);
   const views = mailboxes.map(mailboxViews);

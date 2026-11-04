@@ -1,12 +1,14 @@
-// lb-cabinet.js: the single-page five-board DOC cabinet (doc-wasm/linkbus2).
-// Creates the shared buffers, the hub worker, five board workers (master
-// plus four satellites) and the master's graphics partner worker, and
-// exposes the run state as window.cabinet for tools/linked-run.mjs.
+// lb-cabinet.js: the single-page linked DOC cabinet (doc-wasm/linkbus2),
+// four seats (five boards plus the graphics partner, the default) or eight
+// seats (nine plus the partner, linkbus/EIGHT_SEATS.md). Creates the shared
+// buffers, the hub worker, one board worker per ring node (master plus the
+// satellites) and the master's graphics partner worker, and exposes the run
+// state as window.cabinet for tools/linked-run.mjs.
 // No network code: the player's own files come from the file picker.
 // Copyright (C) 2026 John R Reeves III
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-import { MB, MB_TOTAL_BYTES, CABINET_TOTAL_BYTES, CABINET_SNAPSHOT_BYTES, EDITION_A } from './lb-lockstep.js';
+import { MB, MB_TOTAL_BYTES, CABINET_TOTAL_BYTES, CABINET_SNAPSHOT_BYTES, EDITION_A, HUB_STATUS } from './lb-lockstep.js';
 import { MASTER, PARTNER, vblankNumber, createFramePairer } from './race-pair.js';
 
 // The race screen's two page canvases (board0 left, partner right) show the
@@ -63,19 +65,40 @@ function createRacePresenter(left, right, onPair) {
   };
 }
 
-const HUB_WORDS = 64;
 export const SESSION_TAG = 0x4c425332; // "LBS2"
 
-// Board table: index, label, boardId, ring seat, ActAsServer, MultiboardSlaves.
-export const BOARDS = Object.freeze([
-  { index: 0, label: 'board0', boardId: 0, seat: 0, actAsServer: true, multiboardSlaves: 2, cabinet: true },
-  { index: 1, label: 'board1', boardId: 0, seat: 1, actAsServer: false, multiboardSlaves: 1, cabinet: false },
-  { index: 2, label: 'board2', boardId: 0, seat: 2, actAsServer: false, multiboardSlaves: 1, cabinet: false },
-  { index: 3, label: 'board3', boardId: 0, seat: 3, actAsServer: false, multiboardSlaves: 1, cabinet: false },
-  { index: 4, label: 'board4', boardId: 0, seat: 4, actAsServer: false, multiboardSlaves: 1, cabinet: false },
-  { index: 5, label: 'partner', boardId: 1, seat: -1, actAsServer: true, multiboardSlaves: 2, cabinet: true },
-]);
+// Satellite counts the cabinet supports. The ring is the master plus the
+// satellites (n = seats + 1); the core sets the game's EEPROM link bytes
+// from n (naomi_network.cpp SetNaomiNetworkConfig: byte 0x4e low bits
+// n - 2, so 3 for four seats and 7 for eight), as the native master does
+// from the satellites that joined. Native eight-seat cabinets use the same
+// per-board settings as four-seat ones (master ActAsServer, MultiboardSlaves
+// 2; satellites MultiboardSlaves 1); only the number of satellites differs.
+export const SEAT_COUNTS = Object.freeze([4, 8]);
 
+// Board table for a cabinet with `seats` satellites: index, label, boardId,
+// ring seat, ActAsServer, MultiboardSlaves. board0 is the master (ring seat
+// 0), board1..board<seats> the satellites (ring seats 1..seats), and the
+// partner (the master's graphics board, BoardId 1, no ring seat) is last,
+// at index seats + 1.
+export function cabinetBoards(seats = 4) {
+  if (!SEAT_COUNTS.includes(seats)) throw new Error(`seats must be one of ${SEAT_COUNTS.join(', ')}`);
+  const out = [{ index: 0, label: 'board0', boardId: 0, seat: 0, actAsServer: true, multiboardSlaves: 2, cabinet: true }];
+  for (let i = 1; i <= seats; i++) out.push({ index: i, label: `board${i}`, boardId: 0, seat: i, actAsServer: false, multiboardSlaves: 1, cabinet: false });
+  out.push({ index: seats + 1, label: 'partner', boardId: 1, seat: -1, actAsServer: true, multiboardSlaves: 2, cabinet: true });
+  return Object.freeze(out.map((b) => Object.freeze(b)));
+}
+
+// The four-seat table (the pilot's cabinet).
+export const BOARDS = cabinetBoards(4);
+
+// comm_status2 of a linked board is (satellites << 8) | node id
+// (naomi_m3comm.cpp connectedState); the board worker reports it as hex.
+export const isLinkedStatus = (comm2, seats = 4) => typeof comm2 === 'string' && comm2 !== '' && parseInt(comm2, 16) >> 8 === seats;
+
+// seats: 4 (default) or 8. canvases: one per board in cabinetBoards(seats)
+// order; a seat whose canvas is missing (null) draws into a worker canvas
+// that is never shown (a server running empty seats, say).
 // Player seat options (the stable game, cabinet-game.js):
 //   input:       SharedArrayBuffer (Int32 x 4, joypad masks of ports 0..3)
 //   inputBoard:  the board label that reads it (default board1)
@@ -89,13 +112,17 @@ export const BOARDS = Object.freeze([
 //   presentRace: board0 and the partner hand their frames to the page, which
 //                shows the two halves together (race-pair.js); default on
 //   onRacePair:  diagnostics, every race pair shown (createRacePresenter)
+//   edition, sessionTag: the link's edition tag (1 = A, 2 = B) and session tag;
+//                every board and the hub get the same pair (edition-b.js linkTags)
 // Pacing: paceHz paces the hub (every seat one vblank per round, so 60 is
 // 60 guest vblanks a second per board); the boards themselves never sleep.
-export function startCabinet({ files, game, canvases, frames = 3000, hashEvery = 60, pinTime = 1767225600,
+export function startCabinet({ files, game, canvases, seats = 4, frames = 3000, hashEvery = 60, pinTime = 1767225600,
   jitDet = 1, preserve = false, paceHz = 0, catchUpMs = 250, presses = {}, cards = {}, bank = 'snapshot', dynarec = 1, barrierTimeoutMs = 10000, yieldEvery = 1, verbose = false, log = () => {},
   input = null, inputBoard = 'board1', audio = null, audioBoard = 'board1', audioBoards = null, watchCards = [], onCardWrite = () => {}, onEvent = () => {}, watchCap = 0,
-  presentRace = true, onRacePair = null }) {
-  const n = 5;
+  presentRace = true, onRacePair = null, edition = EDITION_A, sessionTag = SESSION_TAG }) {
+  const boards = cabinetBoards(seats);
+  const n = seats + 1; // ring nodes: the master and the satellites
+  const partnerIndex = boards.length - 1;
   // Audio rings by board label: audioBoards ({ label: { buffer, capacityFrames } },
   // e.g. the seat and the race board), or the single audio/audioBoard pair.
   const rings = { ...(audio ? { [audioBoard]: audio } : {}), ...(audioBoards || {}) };
@@ -103,15 +130,16 @@ export function startCabinet({ files, game, canvases, frames = 3000, hashEvery =
   // the page shows both halves together. presentRace false: each draws into
   // its own page canvas as before.
   const raceSide = (label) => (label === 'board0' ? MASTER : label === 'partner' ? PARTNER : -1);
-  const race = presentRace ? createRacePresenter(canvases[0], canvases[5], onRacePair) : null;
+  const race = presentRace ? createRacePresenter(canvases[0], canvases[partnerIndex], onRacePair) : null;
   const mailboxes = Array.from({ length: n }, () => new SharedArrayBuffer(MB_TOTAL_BYTES));
   const cabinet = new SharedArrayBuffer(bank === 'live' ? CABINET_TOTAL_BYTES : CABINET_SNAPSHOT_BYTES);
   const ctl = new SharedArrayBuffer(16);
-  const hubStatus = new SharedArrayBuffer(HUB_WORDS * 4);
-  const frameCounts = new SharedArrayBuffer(4 * BOARDS.length);
+  const hubStatus = new SharedArrayBuffer(HUB_STATUS.words * 4);
+  const frameCounts = new SharedArrayBuffer(4 * boards.length);
   const state = {
     started: performance.now(),
-    boards: BOARDS.map((b) => ({ label: b.label, ready: false, loaded: false, done: null, samples: [], errors: [], logs: [], startedAt: 0, watch: [] })),
+    seats,
+    boards: boards.map((b) => ({ label: b.label, ready: false, loaded: false, done: null, samples: [], errors: [], logs: [], startedAt: 0, watch: [] })),
     hub: { stopped: false, error: null },
     partnerStartAt: null,
   };
@@ -124,12 +152,13 @@ export function startCabinet({ files, game, canvases, frames = 3000, hashEvery =
     if (e.data.type === 'hub-error') { state.hub.error = e.data.message; log(`[hub] ${e.data.message}`); }
     if (e.data.type === 'hub-stopped') state.hub.stopped = true;
   };
-  hub.postMessage({ type: 'init', n, mailboxes, sessionTag: SESSION_TAG, edition: EDITION_A, status: hubStatus, ctl, frameCounts });
+  hub.postMessage({ type: 'init', n, mailboxes, sessionTag, edition, status: hubStatus, ctl, frameCounts });
 
-  const workers = BOARDS.map((b) => {
+  const workers = boards.map((b) => {
     const w = new Worker(new URL('./lb-board-worker.js', import.meta.url), { type: 'module' });
     const side = race ? raceSide(b.label) : -1;
-    const off = side < 0 ? canvases[b.index].transferControlToOffscreen() : null;
+    const pageCanvas = canvases[b.index] || null;
+    const off = side < 0 && pageCanvas ? pageCanvas.transferControlToOffscreen() : null;
     const st = state.boards[b.index];
     w.onmessage = (e) => {
       const m = e.data;
@@ -150,7 +179,7 @@ export function startCabinet({ files, game, canvases, frames = 3000, hashEvery =
           // Native: the master's first multiboard sync spawns the partner.
           state.partnerStartAt = performance.now() - state.started;
           log(`[cabinet] board0 asks for ${m.slaves} partner(s)`);
-          workers[5].postMessage({ type: 'go' });
+          workers[partnerIndex].postMessage({ type: 'go' });
           break;
         default: break;
       }
@@ -160,14 +189,17 @@ export function startCabinet({ files, game, canvases, frames = 3000, hashEvery =
     const fileCopies = files.map(([name, bytes]) => [name, bytes.slice(0)]);
     w.postMessage({
       type: 'init', label: b.label, index: b.index, boardId: b.boardId, seat: b.seat, n,
-      actAsServer: b.actAsServer, multiboardSlaves: b.multiboardSlaves, edition: EDITION_A, sessionTag: SESSION_TAG,
+      actAsServer: b.actAsServer, multiboardSlaves: b.multiboardSlaves, edition, sessionTag,
       mailbox: b.seat >= 0 ? mailboxes[b.seat] : null, cabinet: b.cabinet ? cabinet : null,
       canvas: off, files: fileCopies, game, frames, hashEvery, pinTime, jitDet, preserve, bank, dynarec, barrierTimeoutMs,
       ctl, frameCounts, hubStatus, autoStart: b.boardId === 0, realtimeHz: 0, presses: presses[b.label] || [], yieldEvery, verbose,
       card: cards[b.label] ? cards[b.label].slice(0) : null, watchCard: watchCards.includes(b.label),
       input: input && b.label === inputBoard ? input : null,
       audio: rings[b.label] || null,
-      present: side >= 0 ? { width: canvases[b.index].width, height: canvases[b.index].height } : null,
+      present: side >= 0 ? { width: pageCanvas ? pageCanvas.width : 640, height: pageCanvas ? pageCanvas.height : 480 } : null,
+      // Not a race screen board and no page canvas: the worker draws into a
+      // canvas of its own that is never shown.
+      hidden: side < 0 && !pageCanvas,
     }, [...(off ? [off] : []), ...fileCopies.map(([, a]) => a)]);
     return w;
   });
@@ -179,8 +211,10 @@ export function startCabinet({ files, game, canvases, frames = 3000, hashEvery =
     hubStatus() {
       const g = (i) => Atomics.load(hubI32, i);
       const per = (base) => Array.from({ length: n }, (_, i) => g(base + i));
-      return { round: g(0), waitingSeat: g(1), running: g(2), emptyRounds: g(3), overruns: g(4), busyMs: g(5), lateResets: g(6), lateMs: g(7),
-        txSeq: per(8), refused: per(16), sizeMismatch: per(24), unsized: per(32) };
+      const H = HUB_STATUS;
+      return { round: g(H.round), waitingSeat: g(H.waitingSeat), running: g(H.running), emptyRounds: g(H.emptyRounds), overruns: g(H.overruns),
+        busyMs: g(H.busyMs), lateResets: g(H.lateResets), lateMs: g(H.lateMs),
+        txSeq: per(H.txSeq), refused: per(H.refused), sizeMismatch: per(H.sizeMismatch), unsized: per(H.unsized) };
     },
     frameCounts: () => Array.from(counts),
     // Guest vblanks each seat has reached (its vblank barrier count).
@@ -190,7 +224,7 @@ export function startCabinet({ files, game, canvases, frames = 3000, hashEvery =
     // null after timeoutMs (default: the barrier timeout plus 2 s, so a
     // board held at a stalled barrier still answers).
     finalCard(label, timeoutMs = barrierTimeoutMs + 2000) {
-      const w = workers[BOARDS.findIndex((x) => x.label === label)];
+      const w = workers[boards.findIndex((x) => x.label === label)];
       if (!w) return Promise.resolve(null);
       return new Promise((resolve) => {
         const t = setTimeout(() => { finalWaits.delete(label); resolve(null); }, timeoutMs);
@@ -223,5 +257,7 @@ export function startCabinet({ files, game, canvases, frames = 3000, hashEvery =
       Atomics.notify(cab, 2); // generation
     },
     workers,
+    seats,
+    boards,
   };
 }

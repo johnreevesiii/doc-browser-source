@@ -1,5 +1,5 @@
-// lb-lockstep.js: lockstep LinkBus hub for the single-page five-board
-// cabinet (doc-wasm/linkbus2). Pure functions plus SharedArrayBuffer mailbox
+// lb-lockstep.js: lockstep LinkBus hub for the single-page cabinet, four or
+// eight seats (doc-wasm/linkbus2). Pure functions plus SharedArrayBuffer mailbox
 // helpers; no network code. Used by lb-hub-worker.js and the node tests.
 // Copyright (C) 2026 John R Reeves III
 // SPDX-License-Identifier: GPL-2.0-or-later
@@ -44,6 +44,16 @@ export const MB = Object.freeze({
 export const mbRxBuffer = (i) => MB.headerBytes + MB.bufferBytes * i;
 export const MB_TX_BUFFER = MB.headerBytes + MB.bufferBytes * 3;
 export const MB_TOTAL_BYTES = MB_TX_BUFFER + SLOT_HEADER_BYTES + MAX_PAYLOAD;
+
+// Hub status words (Int32, written by lb-hub-worker.js, read by
+// lb-cabinet.js hubStatus()): single words, then one word per ring node for
+// each per-seat counter. 16 words per counter: a ring of up to 16 nodes
+// (kMaxRingNodes), so nine (eight seats) fit. (The four-seat layout had 8
+// per counter; only these offsets changed, not what is counted.)
+export const HUB_STATUS = Object.freeze({
+  round: 0, waitingSeat: 1, running: 2, emptyRounds: 3, overruns: 4, busyMs: 5, lateResets: 6, lateMs: 7,
+  txSeq: 8, refused: 24, sizeMismatch: 40, unsized: 56, words: 72, maxNodes: 16,
+});
 
 // MultiboardSabLayout: 64-byte header, then the 1 MB bank.
 export const CABINET_TOTAL_BYTES = 64 + 0x100000;

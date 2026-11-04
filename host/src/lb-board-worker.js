@@ -10,7 +10,7 @@
 //   partner:          BoardId 1 (graphics board of the master pair), same options,
 //                     SAB multiboard, no ring; started only when board 0
 //                     posts linkbus-start-partners (multiboard.cpp startSlave)
-//   boards 1..4:      seats 1..4, NetworkEnable, ActAsServer off, MultiboardSlaves 1
+//   boards 1..N:      seats 1..N (N = 4 or 8), NetworkEnable, ActAsServer off, MultiboardSlaves 1
 //
 // The core is the linkbus2 link output, served at ./core/ by tools/serve.mjs.
 
@@ -122,7 +122,10 @@ async function init(msg) {
   // OffscreenCanvas of this worker, and every rendered frame goes to the page
   // as an ImageBitmap, which shows the two halves together. Other boards draw
   // into the page canvas they were handed (transferControlToOffscreen).
-  const canvas = msg.present ? new OffscreenCanvas(msg.present.width || 640, msg.present.height || 480) : msg.canvas;
+  // A board with no page canvas (msg.hidden: a seat nobody watches) draws
+  // into a worker canvas that is never shown.
+  const canvas = msg.present ? new OffscreenCanvas(msg.present.width || 640, msg.present.height || 480)
+    : msg.hidden ? new OffscreenCanvas(640, 480) : msg.canvas;
   if (msg.present) {
     present = { canvas, sync: null, failed: 0 };
     // The board's own sync index in the snapshot bank (race-pair.js frame key).

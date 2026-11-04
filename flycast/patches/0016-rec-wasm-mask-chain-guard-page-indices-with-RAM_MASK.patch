@@ -1,0 +1,55 @@
+From 05521ce1428a4dd97b221bf845abd9772565184b Mon Sep 17 00:00:00 2001
+From: John R Reeves III <johnreevesiii@outlook.com>
+Date: Mon, 2 Nov 2026 08:30:38 -0800
+Subject: [PATCH 16/22] rec-wasm: mask chain guard page indices with RAM_MASK
+
+The chain interior guard and the guard-cell initialisers computed the
+last covered page as (offset + size - 1) >> 12 without masking, so a
+block ending at the top of RAM would read the page-generation cell one
+past the platform's pages. The dispatch path already masks that address
+with RAM_MASK; the three chain sites now do the same.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MGX7KQ5gfrWApgW64pZbQ5
+---
+ core/rec-wasm/rec_wasm.cpp | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/core/rec-wasm/rec_wasm.cpp b/core/rec-wasm/rec_wasm.cpp
+index 16f5d46b7..40f424c1e 100644
+--- a/core/rec-wasm/rec_wasm.cpp
++++ b/core/rec-wasm/rec_wasm.cpp
+@@ -4825,8 +4825,11 @@ static bool buildMultiBlockModule(WasmModuleBuilder& b,
+ 				bool gated = (guard_cells != nullptr);
+ 				u32 cellAddr = 0;
+ 				if (gated) {
++					// Same page math as the dispatch path: mask the last byte
++					// too, so a block at the top of RAM never indexes past
++					// the platform's pages.
+ 					u32 pg0 = ramOffset >> 12;
+-					u32 pg1 = (ramOffset + n_u16 * 2 - 1) >> 12;
++					u32 pg1 = ((ramOffset + n_u16 * 2 - 1) & RAM_MASK) >> 12;
+ 					u32 pgAddr0 = (u32)(uintptr_t)&g_fly_page_gen[pg0];
+ 					cellAddr = (u32)(uintptr_t)&guard_cells[i * 2];
+ #if FLY_SMC_INSURANCE_TICK
+@@ -6167,7 +6170,7 @@ public:
+ 							u32 gro = gphys & RAM_MASK;
+ 							u32 gn16 = cblk->sh4_code_size / 2;
+ 							if (gn16 == 0) gn16 = 1;
+-							u32 gp0 = gro >> 12, gp1 = (gro + gn16 * 2 - 1) >> 12;
++							u32 gp0 = gro >> 12, gp1 = ((gro + gn16 * 2 - 1) & RAM_MASK) >> 12;
+ 							gcells[gi * 2] = g_fly_page_gen[gp0]
+ 								+ (gp1 != gp0 ? g_fly_page_gen[gp1] : 0);
+ 						}
+@@ -6255,7 +6258,7 @@ public:
+ 							u32 gro = gphys & RAM_MASK;
+ 							u32 gn16 = cblk->sh4_code_size / 2;
+ 							if (gn16 == 0) gn16 = 1;
+-							u32 gp0 = gro >> 12, gp1 = (gro + gn16 * 2 - 1) >> 12;
++							u32 gp0 = gro >> 12, gp1 = ((gro + gn16 * 2 - 1) & RAM_MASK) >> 12;
+ 							gcells[gi * 2] = g_fly_page_gen[gp0]
+ 								+ (gp1 != gp0 ? g_fly_page_gen[gp1] : 0);
+ 						}
+-- 
+2.56.0.windows.3
+

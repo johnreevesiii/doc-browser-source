@@ -1,0 +1,50 @@
+From b3cd48fa34f02fe0fc8ebd3346e5f92fa5d3ec10 Mon Sep 17 00:00:00 2001
+From: John R Reeves III <johnreevesiii@outlook.com>
+Date: Mon, 2 Nov 2026 08:29:48 -0800
+Subject: [PATCH 14/22] rec-wasm: update the chain builder's self-loop comment
+
+The comment still said every single-block self-loop emits the idle
+fast-forward. Since the fast-forward predicate was narrowed only pure
+polls and bare waits do. The chain builder keeps excluding every
+self-loop on purpose, so the chain choice does not depend on that
+predicate; the comment now says so.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MGX7KQ5gfrWApgW64pZbQ5
+---
+ core/rec-wasm/rec_wasm.cpp | 19 +++++++++++--------
+ 1 file changed, 11 insertions(+), 8 deletions(-)
+
+diff --git a/core/rec-wasm/rec_wasm.cpp b/core/rec-wasm/rec_wasm.cpp
+index 87c41ba4c..7a6e75652 100644
+--- a/core/rec-wasm/rec_wasm.cpp
++++ b/core/rec-wasm/rec_wasm.cpp
+@@ -4586,14 +4586,17 @@ static std::vector<RuntimeBlockInfo*> discoverChain(RuntimeBlockInfo* entry) {
+ 	std::vector<RuntimeBlockInfo*> chain;
+ 	chain.push_back(entry);
+ 
+-	// ★ IDLE-LOOP EXCLUSION (2026-07-17, chain-shadow finding): single-block
+-	// modules emit the idle soft fast-forward (cap cycle_counter at 32) in
+-	// their epilogue; buildMultiBlockModule does NOT. An idle link spinning
+-	// in-module runs a different cc trajectory than the capped single block
+-	// — the chain-shadow farm measured exactly this (304/6656 pc diffs,
+-	// chain running further than the reference). Idle loops gain nothing
+-	// from chaining (memory-bound waits); keep their verified single-block
+-	// semantics by never chaining from or into them.
++	// SELF-LOOP EXCLUSION (2026-07-17 chain-shadow finding, comment updated
++	// 2026-11-02): a single-block module emits the idle soft fast-forward (cap
++	// cycle_counter at 32) in its epilogue only when fly_block_idle_ff accepts
++	// the block (a pure poll or a bare wait, no memory writes, no loop-carried
++	// registers); buildMultiBlockModule never emits it. An accepted loop
++	// spinning in-module would run a different cc trajectory than the capped
++	// single block (the chain-shadow farm measured 304/6656 pc diffs, chain
++	// running further than the reference). This test is deliberately wider
++	// than fly_block_idle_ff: it excludes EVERY self-loop, including counted
++	// delays that run at full cost, so the chain/no-chain choice never depends
++	// on the fast-forward predicate. Self-loops gain nothing from chaining.
+ 	auto fly_is_idle = [](RuntimeBlockInfo* blk) {
+ 		u32 c = BET_GET_CLS(blk->BlockType);
+ 		if (c == BET_CLS_Static && blk->BlockType != BET_StaticIntr
+-- 
+2.56.0.windows.3
+

@@ -1,0 +1,492 @@
+From 0fb4009b44276c2ed87268ab48053c5942b69ca5 Mon Sep 17 00:00:00 2001
+From: John R Reeves III <johnreevesiii@outlook.com>
+Date: Mon, 2 Nov 2026 13:49:24 -0800
+Subject: [PATCH 9/9] linkbus: vblank barrier; loud snapshot failures (review
+ C1, C2, F4, F5, F11)
+
+C1: frame sync at retro_run return did not keep the boards' guest time
+equal: a retro_run ends at a rendered frame or the render timeout, so
+the master ran about 1.8 vblanks per round and the satellites about 1.
+linkbus_install_vblank_barrier adds a VBlank listener (installed before
+the comm board's) that stores the board's vblank count in the mailbox
+(MailboxLayout::vblankCount) and waits until the hub has published that
+round (MailboxLayout::hubRound), bounded by a timeout; barrierStop
+releases it at shutdown. The hub publishes round k once every seat has
+reached vblank k, after delivering each seat's newest slot frame, so
+every seat advances exactly one guest vblank per round, as natively
+(one hub tick per vblank), and the comm board's take at vblank k reads
+every seat's vblank k - 1 publish.
+
+C2: a first or second multiboard barrier timeout, a vblank barrier
+timeout and a snapshot sync index mismatch are counted, logged once and
+latch a nondeterministic flag. The snapshot log header now carries the
+sync index, checked against the peer's before applying.
+linkbus_mb_stats (10 u32) replaces linkbus_sab_snapshot_stats.
+
+F4: status ops fold into one AND mask and one OR mask per sync, so the
+log holds at most one entry per word and cannot overflow (logEntries is
+kMbDataWords). F5: a peer's log count is clamped to the region. F11:
+the destructor clears the stats pointer.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MGX7KQ5gfrWApgW64pZbQ5
+---
+ core/network/linkbus.h       |  12 +-
+ core/network/linkbus_web.cpp | 257 ++++++++++++++++++++++++-----------
+ 2 files changed, 188 insertions(+), 81 deletions(-)
+
+diff --git a/core/network/linkbus.h b/core/network/linkbus.h
+index 3cab7b72e..14a2294ad 100644
+--- a/core/network/linkbus.h
++++ b/core/network/linkbus.h
+@@ -365,6 +365,10 @@ struct MailboxLayout
+ 	static constexpr u32 txSeq = 12;		// i32
+ 	static constexpr u32 rxLength = 16;		// i32[3] at 16, 20, 24: bytes in rx buffer i
+ 	static constexpr u32 txLength = 28;		// i32
++	// Vblank barrier (linkbus_install_vblank_barrier, browser cabinet):
++	static constexpr u32 vblankCount = 32;	// i32, written by the core: vblanks reached
++	static constexpr u32 hubRound = 36;		// i32, written by the hub: rounds delivered
++	static constexpr u32 barrierStop = 40;	// i32, nonzero = release the barrier (shutdown)
+ 	static constexpr u32 headerBytes = 64;
+ 	static constexpr u32 bufferBytes = sizeof(AssembledFrameHeader) + kMaxPayload;
+ 	static constexpr u32 rxBuffer(int i) { return headerBytes + bufferBytes * (u32)i; }
+@@ -514,7 +518,9 @@ std::unique_ptr<MultiboardBackend> makeSabMultiboardBackend(int boardId);
+ // Snapshot variant of the SAB backend (doc-wasm/linkbus2), for a
+ // deterministic master pair. Each board works on a private copy of the bank
+ // and of the status word and logs its writes. At each sync point (two
+-// generation barriers) every board publishes its log, then applies the logs
++// generation barriers) every board publishes its log (one entry per word
++// written, newest value; status ops folded into one AND mask and one OR
++// mask, so a log cannot overflow), then applies the logs
+ // of all boards in the barrier, in board id order, to its own copy, so all
+ // copies are equal after every sync and nothing a board reads between sync
+ // points depends on host timing. Board 0 also applies them to the shared
+@@ -523,8 +529,8 @@ std::unique_ptr<MultiboardBackend> makeSabMultiboardBackend(int boardId);
+ // MultiboardSabLayout followed by one log region per board.
+ struct MultiboardSnapshotLayout
+ {
+-	static constexpr u32 logEntries = kMbDataWords + 0x10000;	// distinct words + status ops
+-	static constexpr u32 logHeaderBytes = 16;			// i32 entries, i32 overflow
++	static constexpr u32 logEntries = kMbDataWords;		// at most one entry per word
++	static constexpr u32 logHeaderBytes = 16;			// i32 entries, sync index, status AND mask, status OR mask
+ 	static constexpr u32 logBytes = logHeaderBytes + logEntries * 8;	// entry: u32 index, u32 value
+ 	static constexpr u32 logBase = MultiboardSabLayout::totalBytes;
+ 	static constexpr u32 totalBytes = logBase + kMbMaxBoards * logBytes;
+diff --git a/core/network/linkbus_web.cpp b/core/network/linkbus_web.cpp
+index ac6473bc5..2b3053b21 100644
+--- a/core/network/linkbus_web.cpp
++++ b/core/network/linkbus_web.cpp
+@@ -50,12 +50,14 @@
+ #ifdef __EMSCRIPTEN__
+ 
+ #include "linkbus.h"
++#include "emulator.h"
+ 
+ #include <emscripten.h>
+ #include <memory>
+ #include <vector>
+ #include <cstring>
+ #include <cstdint>
++#include <cstdio>
+ 
+ // ---------------------------------------------------------------------------
+ // JS imports: ring mailbox
+@@ -223,6 +225,34 @@ EM_JS(void, lb_cab_get, (int byteOffset, void *dst, int bytes), {
+ 	HEAPU8.set(new Uint8Array(Module.linkbus.cabinet, byteOffset, bytes), dst);
+ });
+ 
++// Vblank barrier (linkbus_install_vblank_barrier). Called at every guest
++// vblank: count it, then wait until the hub has delivered the round for this
++// vblank. Returns 0 ok, 1 timeout, 2 released by the host (shutdown).
++EM_JS(int, lb_vb_barrier, (int timeoutMs, int headerBytes), {
++	var lb = Module.linkbus;
++	var i32 = lb._vbI32 || (lb._vbI32 = new Int32Array(lb.mailbox, 0, headerBytes >> 2));
++	var k = Atomics.add(i32, 8, 1) + 1;
++	Atomics.notify(i32, 8);
++	var now = function () { return performance.now(); };
++	var deadline = now() + Math.max(timeoutMs, 0);
++	for (;;) {
++		var r = Atomics.load(i32, 9);
++		if (r >= k) return 0;
++		if (Atomics.load(i32, 10) !== 0) return 2;
++		var left = deadline - now();
++		if (left <= 0) return 1;
++		try {
++			Atomics.wait(i32, 9, r, Math.min(left, 200));
++		} catch (e) {
++			return 1;	// main thread: cannot block
++		}
++	}
++});
++
++EM_JS(void, lb_warn, (const char *text), {
++	console.warn('[linkbus] ' + UTF8ToString(text));
++});
++
+ EM_JS(void, lb_cab_start_partners, (int boardId, int slaves), {
+ 	var lb = Module.linkbus;
+ 	var msg = { type: 'linkbus-start-partners', boardId: boardId, slaves: slaves };
+@@ -266,6 +296,33 @@ constexpr int kBoardMask = MultiboardSabLayout::boardMask / 4;
+ constexpr int kArrived = MultiboardSabLayout::arrived / 4;
+ constexpr int kData = (int)MultiboardSabLayout::data;
+ 
++// Multiboard and vblank barrier counters (linkbus_mb_stats). Any timeout or
++// sync mismatch latches nondeterministic: from then on two runs of the same
++// inputs need not agree, and the harness fails the run.
++struct MbStats
++{
++	u32 firstTimeout = 0;	// first (or only) multiboard barrier timed out
++	u32 secondTimeout = 0;	// snapshot: second barrier timed out
++	u32 syncMismatch = 0;	// snapshot: a peer's log was for another sync index
++	u32 vblanks = 0;		// vblank barrier: vblanks passed
++	u32 vblankTimeout = 0;	// vblank barrier: gave up waiting for the hub
++	u32 vblankReleased = 0;	// vblank barrier: released by the host (shutdown)
++	bool nondeterministic = false;
++};
++MbStats mbStats;
++u32 vblankBarrierTimeoutMs = 10000;
++
++void noteBarrierTimeout(int id, const char *what)
++{
++	if (!mbStats.nondeterministic)
++	{
++		char text[96];
++		snprintf(text, sizeof(text), "board %d: %s timed out; run is no longer deterministic", id, what);
++		lb_warn(text);
++	}
++	mbStats.nondeterministic = true;
++}
++
+ class SabBoard : public MultiboardBackend
+ {
+ public:
+@@ -325,7 +382,10 @@ public:
+ 		{
+ 		case 0: return BarrierResult::Ok;
+ 		case 2: return BarrierResult::Exit;
+-		default: return BarrierResult::Timeout;
++		default:
++			noteBarrierTimeout(id, "multiboard barrier");
++			mbStats.firstTimeout++;
++			return BarrierResult::Timeout;
+ 		}
+ 	}
+ 
+@@ -349,12 +409,18 @@ private:
+ };
+ 
+ // Snapshot backend (see MultiboardSnapshotLayout in linkbus.h).
+-constexpr u32 kStatusOp = 0x80000000u;	// log entry index of a status op: kStatusOp | op
++class SabSnapshotBoard;
++SabSnapshotBoard *snapshotBoard = nullptr;	// the board this core runs, for stats
+ 
+ class SabSnapshotBoard : public MultiboardBackend
+ {
+ public:
+-	~SabSnapshotBoard() override { requestExit(); }
++	~SabSnapshotBoard() override
++	{
++		if (snapshotBoard == this)
++			snapshotBoard = nullptr;
++		requestExit();
++	}
+ 
+ 	explicit SabSnapshotBoard(int boardId)
+ 		: id(boardId), bank(kMbDataWords), pos(kMbDataWords, kNone)
+@@ -374,14 +440,17 @@ public:
+ 		lb_cab_get((int)kData, bank.data(), (int)(kMbDataWords * 2));
+ 		stat = statBase = (u16)lb_cab_hdr(0, kStatus, 0);
+ 		log.reserve(4096);
++		snapshotBoard = this;
+ 	}
+ 
+ 	int boardId() const override { return id; }
+ 
++	// Status ops fold into one AND mask and one OR mask per sync:
++	// new = (old & andMask) | orMask, which replays any sequence of them.
+ 	u16 status() const override { return stat; }
+-	void setStatus(u16 v) override { stat = v; logOp(1, v); }
+-	void statusOr(u16 bits) override { stat |= bits; logOp(2, bits); }
+-	void statusAnd(u16 bits) override { stat &= bits; logOp(3, bits); }
++	void setStatus(u16 v) override { stat = v; andMask = 0; orMask = v; }
++	void statusOr(u16 bits) override { stat |= bits; orMask |= bits; }
++	void statusAnd(u16 bits) override { stat &= bits; andMask &= bits; orMask &= bits; }
+ 
+ 	u16 read16(u32 i) const override { return bank[i & (kMbDataWords - 1)]; }
+ 	void write16(u32 i, u16 v) override
+@@ -390,14 +459,13 @@ public:
+ 		bank[i] = v;
+ 		if (pos[i] != kNone)
+ 			log[pos[i] + 1] = v;	// same word again: one entry, newest value
+-		else if (log.size() / 2 < MultiboardSnapshotLayout::logEntries)
++		else
+ 		{
++			// At most kMbDataWords distinct words: the log cannot overflow.
+ 			pos[i] = (u32)log.size();
+ 			log.push_back(i);
+ 			log.push_back(v);
+ 		}
+-		else
+-			overflow = true;
+ 	}
+ 	u32 read32(u32 i) const override
+ 	{
+@@ -428,13 +496,21 @@ public:
+ 		// Publish this board's log. The other boards read it only between
+ 		// the two barriers below; this board writes it only before the first.
+ 		const int region = (int)(L::logBase + (u32)id * L::logBytes);
+-		const int32_t hdr[4] = { (int32_t)(log.size() / 2), overflow ? 1 : 0, 0, 0 };
++		const int32_t hdr[4] = { (int32_t)(log.size() / 2), (int32_t)syncs, (int32_t)andMask, (int32_t)orMask };
+ 		lb_cab_put(region, hdr, (int)sizeof(hdr));
+ 		if (!log.empty())
+ 			lb_cab_put(region + (int)L::logHeaderBytes, log.data(), (int)(log.size() * 4));
+-		BarrierResult r = toResult(lb_cab_barrier(id, (int)timeoutMs));
+-		if (r != BarrierResult::Ok)
+-			return r;	// keep the log: it is published again at the next sync
++		const int first = lb_cab_barrier(id, (int)timeoutMs);
++		if (first == 2)
++			return BarrierResult::Exit;
++		if (first != 0)
++		{
++			// Keep the log: it is published again at the next sync. The
++			// boards' sync indexes now differ; the next apply detects it.
++			noteBarrierTimeout(id, "snapshot first barrier");
++			mbStats.firstTimeout++;
++			return BarrierResult::Timeout;
++		}
+ 		const u32 mask = (u32)lb_cab_hdr(0, kBoardMask, 0);
+ 		u16 s = statBase;
+ 		for (int b = 0; b < kMbMaxBoards; b++)
+@@ -442,54 +518,55 @@ public:
+ 			if (!(mask & (1u << b)))
+ 				continue;
+ 			const std::vector<u32> *entries = &log;
++			u16 bAnd = andMask, bOr = orMask;
+ 			if (b != id)
+ 			{
+ 				const int other = (int)(L::logBase + (u32)b * L::logBytes);
+ 				int32_t oh[4];
+ 				lb_cab_get(other, oh, (int)sizeof(oh));
+-				if (oh[1] != 0)
+-					stats.overflow++;
+-				peer.resize((size_t)oh[0] * 2);
++				if ((u32)oh[1] != syncs)
++				{
++					if (mbStats.syncMismatch++ == 0)
++						lb_warn("snapshot: peer log is for another sync index; run is no longer deterministic");
++					mbStats.nondeterministic = true;
++				}
++				u32 count = oh[0] < 0 ? 0 : (u32)oh[0];
++				if (count > L::logEntries)
++					count = L::logEntries;	// a corrupt header cannot overrun the region
++				peer.resize((size_t)count * 2);
+ 				if (!peer.empty())
+ 					lb_cab_get(other + (int)L::logHeaderBytes, peer.data(), (int)(peer.size() * 4));
+ 				entries = &peer;
++				bAnd = (u16)oh[2];
++				bOr = (u16)oh[3];
+ 			}
+ 			for (size_t k = 0; k + 1 < entries->size(); k += 2)
+-			{
+-				const u32 idx = (*entries)[k];
+-				const u32 val = (*entries)[k + 1];
+-				if (idx & kStatusOp)
+-				{
+-					switch (idx & 3)
+-					{
+-					case 1: s = (u16)val; break;
+-					case 2: s |= (u16)val; break;
+-					case 3: s &= (u16)val; break;
+-					}
+-				}
+-				else
+-					bank[idx & (kMbDataWords - 1)] = (u16)val;
+-			}
++				bank[(*entries)[k] & (kMbDataWords - 1)] = (u16)(*entries)[k + 1];
++			s = (u16)((s & bAnd) | bOr);
+ 			if (id == 0)
+ 				applyShared(*entries);	// board order, as above
+ 		}
+-		if (overflow)
+-			stats.overflow++;
+ 		if (id == 0)
+ 			lb_cab_hdr(1, kStatus, s);
+ 		stat = statBase = s;
++		andMask = 0xffff;
++		orMask = 0;
+ 		for (size_t k = 0; k + 1 < log.size(); k += 2)
+-			if (!(log[k] & kStatusOp))
+-				pos[log[k]] = kNone;
++			pos[log[k]] = kNone;
+ 		log.clear();
+-		overflow = false;
+-		stats.syncs++;
++		syncs++;
+ 		// Second barrier: nobody publishes the next log (or touches the
+-		// shared bank) before every board has read this round.
+-		r = toResult(lb_cab_barrier(id, (int)timeoutMs));
+-		if (r == BarrierResult::Timeout)
+-			stats.secondTimeout++;
+-		return r == BarrierResult::Exit ? r : BarrierResult::Ok;
++		// shared bank) before every board has read this round. A timeout here
++		// shows up as a sync index mismatch at the next apply.
++		const int second = lb_cab_barrier(id, (int)timeoutMs);
++		if (second == 2)
++			return BarrierResult::Exit;
++		if (second != 0)
++		{
++			noteBarrierTimeout(id, "snapshot second barrier");
++			mbStats.secondTimeout++;
++		}
++		return BarrierResult::Ok;
+ 	}
+ 
+ 	void requestExit() override
+@@ -507,7 +584,7 @@ public:
+ 		lb_cab_start_partners(id, slaves);
+ 	}
+ 
+-	struct Stats { u32 syncs = 0, overflow = 0, secondTimeout = 0; } stats;
++	u32 syncCount() const { return syncs; }
+ 
+ 	// 64-bit FNV-1a over the private bank and status, for run comparison.
+ 	uint64_t bankHash() const
+@@ -521,38 +598,40 @@ public:
+ 
+ private:
+ 	static constexpr u32 kNone = 0xffffffffu;
+-	static BarrierResult toResult(int r)
+-	{
+-		return r == 0 ? BarrierResult::Ok : r == 2 ? BarrierResult::Exit : BarrierResult::Timeout;
+-	}
+-	void logOp(u32 op, u16 v)
+-	{
+-		if (log.size() / 2 < MultiboardSnapshotLayout::logEntries)
+-		{
+-			log.push_back(kStatusOp | op);
+-			log.push_back(v);
+-		}
+-		else
+-			overflow = true;
+-	}
+ 	static void applyShared(const std::vector<u32> &entries)
+ 	{
+ 		for (size_t k = 0; k + 1 < entries.size(); k += 2)
+-			if (!(entries[k] & kStatusOp))
+-				lb_cab_write16(entries[k] & (kMbDataWords - 1), (int)entries[k + 1], kData);
++			lb_cab_write16(entries[k] & (kMbDataWords - 1), (int)entries[k + 1], kData);
+ 	}
+ 
+ 	int id;
+ 	std::vector<u16> bank;
+ 	std::vector<u32> pos;		// log position of each word written since the last sync
+-	std::vector<u32> log;		// pairs: word index (or kStatusOp | op), value
++	std::vector<u32> log;		// pairs: word index, value
+ 	std::vector<u32> peer;
+ 	u16 stat = 0;
+ 	u16 statBase = 0;
+-	bool overflow = false;
++	u16 andMask = 0xffff;
++	u16 orMask = 0;
++	u32 syncs = 0;
+ };
+ 
+-SabSnapshotBoard *snapshotBoard = nullptr;	// the board this core runs, for stats
++void vblankBarrierCallback(Event, void *)
++{
++	switch (lb_vb_barrier((int)vblankBarrierTimeoutMs, (int)MailboxLayout::headerBytes))
++	{
++	case 0:
++		mbStats.vblanks++;
++		break;
++	case 2:
++		mbStats.vblankReleased++;
++		break;
++	default:
++		mbStats.vblankTimeout++;
++		noteBarrierTimeout(-1, "vblank barrier");
++		break;
++	}
++}
+ 
+ FramePacer pacer;
+ 
+@@ -569,9 +648,7 @@ std::unique_ptr<MultiboardBackend> makeSabSnapshotMultiboardBackend(int boardId)
+ {
+ 	if (!lb_cab_ok((int)MultiboardSnapshotLayout::totalBytes))
+ 		return nullptr;
+-	auto board = std::make_unique<SabSnapshotBoard>(boardId);
+-	snapshotBoard = board.get();
+-	return board;
++	return std::make_unique<SabSnapshotBoard>(boardId);
+ }
+ 
+ } // namespace linkbus
+@@ -601,6 +678,26 @@ EMSCRIPTEN_KEEPALIVE int linkbus_install_mailbox(int slotId, int slotCount, int
+ 	return 0;
+ }
+ 
++// Vblank barrier for the single-page cabinet (worker only). At every guest
++// vblank, before the M3 comm board's take and publish for that vblank, the
++// core stores its vblank count in the mailbox (MailboxLayout::vblankCount)
++// and waits until the hub has published the round for it
++// (MailboxLayout::hubRound >= count), up to timeoutMs (counted, latched as
++// nondeterministic). The hub publishes round k once every seat has reached
++// vblank k, after delivering each seat's newest slot frame, which is the one
++// it published at vblank k - 1. So every seat advances exactly one guest
++// vblank per hub round, the native one-tick-per-vblank model without its
++// timing. Must be installed after linkbus_install_mailbox and before the
++// game is loaded (so it runs before the comm board's vblank listener).
++EMSCRIPTEN_KEEPALIVE int linkbus_install_vblank_barrier(unsigned timeoutMs)
++{
++	if (!lb_mb_ok((int)MailboxLayout::totalBytes))
++		return 3;
++	vblankBarrierTimeoutMs = timeoutMs;
++	EventManager::listen(Event::VBlank, vblankBarrierCallback, nullptr);
++	return 0;
++}
++
+ EMSCRIPTEN_KEEPALIVE void linkbus_uninstall_ring() {
+ 	setRingBackend(nullptr);
+ }
+@@ -619,20 +716,24 @@ EMSCRIPTEN_KEEPALIVE u32 linkbus_sab_snapshot_bytes() {
+ 	return MultiboardSnapshotLayout::totalBytes;
+ }
+ 
+-// Snapshot board stats: out[0] syncs, out[1] log overflows, out[2] second
+-// barrier timeouts, out[3..4] bank hash (lo, hi). Returns 5, or 0 when this
+-// core has no snapshot board.
+-EMSCRIPTEN_KEEPALIVE int linkbus_sab_snapshot_stats(u32 *out)
++// Multiboard and vblank barrier stats (10 u32): vblanks, vblankTimeout,
++// vblankReleased, firstTimeout, secondTimeout, syncMismatch,
++// nondeterministic (0/1), snapshot syncs, snapshot bank hash (lo, hi; 0 when
++// this core has no snapshot board). Returns 10.
++EMSCRIPTEN_KEEPALIVE int linkbus_mb_stats(u32 *out)
+ {
+-	if (snapshotBoard == nullptr)
+-		return 0;
+-	const uint64_t h = snapshotBoard->bankHash();
+-	out[0] = snapshotBoard->stats.syncs;
+-	out[1] = snapshotBoard->stats.overflow;
+-	out[2] = snapshotBoard->stats.secondTimeout;
+-	out[3] = (u32)h;
+-	out[4] = (u32)(h >> 32);
+-	return 5;
++	const uint64_t h = snapshotBoard != nullptr ? snapshotBoard->bankHash() : 0;
++	out[0] = mbStats.vblanks;
++	out[1] = mbStats.vblankTimeout;
++	out[2] = mbStats.vblankReleased;
++	out[3] = mbStats.firstTimeout;
++	out[4] = mbStats.secondTimeout;
++	out[5] = mbStats.syncMismatch;
++	out[6] = mbStats.nondeterministic ? 1 : 0;
++	out[7] = snapshotBoard != nullptr ? snapshotBoard->syncCount() : 0;
++	out[8] = (u32)h;
++	out[9] = (u32)(h >> 32);
++	return 10;
+ }
+ 
+ // Ring stats (8 u32): published, taken, stale, dropped, badEdition, badSize,
+-- 
+2.56.0.windows.3
+

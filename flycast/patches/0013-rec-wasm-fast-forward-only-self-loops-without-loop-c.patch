@@ -1,0 +1,147 @@
+From 614a3356864a3c85b0dd1d58bb4044d7247216cd Mon Sep 17 00:00:00 2001
+From: John R Reeves III <johnreevesiii@outlook.com>
+Date: Mon, 2 Nov 2026 08:29:48 -0800
+Subject: [PATCH 13/22] rec-wasm: fast-forward only self-loops without
+ loop-carried state
+
+fly_block_idle_ff accepted any conditional self-loop that read memory
+and wrote none, and every unconditional self-loop with no test at all.
+Loops that keep state in registers between passes were fast-forwarded
+too, so a poll with a timeout (L: mov.l @r4,r0; tst #1,r0; bf/s L;
+dt r5) lost its timeout count and a calibration loop (L: add #1,r1;
+mov.l @r2,r0; tst #1,r0; bt L) counted far fewer passes than it ran.
+An unconditional loop that stored to memory (L: add #1,r0;
+mov.l r0,@r1; bra L) was capped as well.
+
+A self-loop now qualifies only when one pass cannot change what the
+next pass does: no memory write (writem or pref, which flushes a store
+queue), no interpreter fallback and no op with hidden state (div1,
+sync_sr, sync_fpscr, frswap, illegal, debug), and every register it
+writes other than T is written before any read in the block. A
+conditional loop must still read memory; an unconditional one is a
+bare wait for an interrupt. The compiled epilogue and the SHIL bridge
+both call the same predicate, so they stay consistent.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MGX7KQ5gfrWApgW64pZbQ5
+---
+ core/rec-wasm/rec_wasm.cpp | 93 +++++++++++++++++++++++++++++++-------
+ 1 file changed, 76 insertions(+), 17 deletions(-)
+
+diff --git a/core/rec-wasm/rec_wasm.cpp b/core/rec-wasm/rec_wasm.cpp
+index 7a1cc1e55..87c41ba4c 100644
+--- a/core/rec-wasm/rec_wasm.cpp
++++ b/core/rec-wasm/rec_wasm.cpp
+@@ -1530,33 +1530,92 @@ static void applyBlockExitCpp(RuntimeBlockInfo* block) {
+ 
+ // Idle self-loop soft fast-forward (cap cycle_counter at 32 when the block
+ // branches back to itself). Native Flycast dynarecs have no idle skip and
+-// charge each pass guest_cycles; rec-wasm keeps the skip for real waits only:
+-//  - an unconditional self-loop (bra to itself) waits for an interrupt;
+-//  - a conditional self-loop qualifies only when it polls: it reads memory
+-//    and writes none and has no interpreter-fallback op. A conditional
+-//    self-loop that only touches registers, or that keeps its counter in
+-//    memory (read, add, write back: the NAOMI BIOS delay loops at
+-//    0x0c034b8a and 0x0c034b9e), is a counted delay. Fast-forwarding those
+-//    charged up to a timeslice per pass and stretched every BIOS delay
+-//    (about 45 guest seconds of boot against about 17 on the interpreter,
+-//    which is itself underclocked 8x).
++// charge each pass guest_cycles; rec-wasm keeps the skip for real waits only.
++// A self-loop qualifies only when one pass cannot change what the next pass
++// does, so skipping passes is invisible to the guest apart from timing:
++//  - it writes no memory (no writem, no pref, which flushes a store queue);
++//  - it has no interpreter-fallback op and no op with hidden state (div1
++//    keeps Q and M, sync_sr and sync_fpscr and frswap switch banks);
++//  - it carries no register state between passes: every register it writes,
++//    other than T, is written before any read in the block. A dt counter, an
++//    add #1 calibration counter or a pointer walk is loop-carried, so a poll
++//    with a timeout (L: mov.l @r4,r0; tst #1,r0; bf/s L; dt r5) or a
++//    calibration loop (L: add #1,r1; mov.l @r2,r0; tst #1,r0; bt L) is a
++//    counted loop and runs at full cost;
++//  - a conditional self-loop must also read memory (it polls). An
++//    unconditional one (bra to itself) waits for an interrupt.
++// A conditional self-loop that only touches registers, or that keeps its
++// counter in memory (read, add, write back: the NAOMI BIOS delay loops at
++// 0x0c034b8a and 0x0c034b9e), is a counted delay. Fast-forwarding those
++// charged up to a timeslice per pass and stretched every BIOS delay (about
++// 45 guest seconds of boot against about 17 on the interpreter, which is
++// itself underclocked 8x).
+ // Shared by the block emitter and the SHIL bridge so both charge alike.
++// Adds the hardware registers p names to set. Returns false for a register
++// index outside the 128-bit set (the caller then refuses the fast-forward).
++static bool fly_idle_reg_mark(u64 (&set)[2], const shil_param& p)
++{
++	if (!p.is_reg())
++		return true;
++	u32 base = p._imm;
++	u32 n = p.count();
++	for (u32 i = 0; i < n; i++) {
++		u32 r = base + i;
++		if (r >= 128)
++			return false;
++		set[r >> 6] |= 1ull << (r & 63);
++	}
++	return true;
++}
++
+ static bool fly_block_idle_ff(const RuntimeBlockInfo* block)
+ {
+ 	u32 bcls = BET_GET_CLS(block->BlockType);
+-	if (bcls == BET_CLS_Static)
+-		return block->BlockType != BET_StaticIntr && block->BranchBlock == block->vaddr;
+-	if (bcls != BET_CLS_COND
+-	    || (block->BranchBlock != block->vaddr && block->NextBlock != block->vaddr))
++	if (bcls == BET_CLS_Static) {
++		if (block->BlockType == BET_StaticIntr || block->BranchBlock != block->vaddr)
++			return false;
++	} else if (bcls != BET_CLS_COND
++	           || (block->BranchBlock != block->vaddr && block->NextBlock != block->vaddr)) {
+ 		return false;
++	}
+ 	bool reads = false;
++	u64 defined[2] = { 0, 0 };    // written so far in this pass
++	u64 carried[2] = { 0, 0 };    // read before being written in this pass
++	u64 written[2] = { 0, 0 };    // written anywhere in the block
+ 	for (const shil_opcode& op : block->oplist) {
+-		if (op.op == shop_writem || op.op == shop_ifb)
++		switch (op.op) {
++		case shop_writem: case shop_pref: case shop_ifb: case shop_illegal:
++		case shop_div1: case shop_sync_sr: case shop_sync_fpscr: case shop_frswap:
++		case shop_debug_1: case shop_debug_3:
+ 			return false;
+-		if (op.op == shop_readm)
++		case shop_readm:
+ 			reads = true;
++			break;
++		default:
++			break;
++		}
++		const shil_param* srcs[3] = { &op.rs1, &op.rs2, &op.rs3 };
++		for (const shil_param* p : srcs) {
++			if (!p->is_reg())
++				continue;
++			u64 tmp[2] = { 0, 0 };
++			if (!fly_idle_reg_mark(tmp, *p))
++				return false;
++			carried[0] |= tmp[0] & ~defined[0];
++			carried[1] |= tmp[1] & ~defined[1];
++		}
++		const shil_param* dsts[2] = { &op.rd, &op.rd2 };
++		for (const shil_param* p : dsts) {
++			if (!fly_idle_reg_mark(defined, *p) || !fly_idle_reg_mark(written, *p))
++				return false;
++		}
+ 	}
+-	return reads;
++	// T is the loop condition itself; it is recomputed every pass.
++	u64 tbit = 1ull << (reg_sr_T & 63);
++	carried[reg_sr_T >> 6] &= ~tbit;
++	if ((carried[0] & written[0]) || (carried[1] & written[1]))
++		return false;
++	return bcls == BET_CLS_Static || reads;
+ }
+ 
+ // Applies the idle soft fast-forward after a bridged (SHIL) execution, the
+-- 
+2.56.0.windows.3
+

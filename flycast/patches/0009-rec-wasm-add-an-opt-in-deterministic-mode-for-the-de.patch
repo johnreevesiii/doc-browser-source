@@ -1,0 +1,61 @@
+From 216aeae9f47ec8e95db90a398339e4542a1e94fe Mon Sep 17 00:00:00 2001
+From: John R Reeves III <johnreevesiii@outlook.com>
+Date: Mon, 2 Nov 2026 07:42:27 -0800
+Subject: [PATCH 09/22] rec-wasm: add an opt-in deterministic mode for the
+ determinism probe
+
+Which blocks run compiled, bridged through SHIL, or inside a chain
+module depends on wall-clock budgets (FLY_FRAME_BUDGET_MS, the sync
+compile budget, the chain sweep time cap) and on when async compiles
+resolve. Those choices are guest visible: two lockstep runs of Derby
+Owners Club with identical inputs diverged in the BIOS phase (frame
+240, same cycle count, different loop counter in r2).
+
+fly_set_deterministic(1) makes every compile synchronous and turns off
+the chain sweep. With it, repeated runs and Chromium against Firefox
+match over 9000 frames. Off by default, so normal play is unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MGX7KQ5gfrWApgW64pZbQ5
+---
+ core/rec-wasm/rec_wasm.cpp | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/core/rec-wasm/rec_wasm.cpp b/core/rec-wasm/rec_wasm.cpp
+index 0cf8dcdee..d57fbbb07 100644
+--- a/core/rec-wasm/rec_wasm.cpp
++++ b/core/rec-wasm/rec_wasm.cpp
+@@ -590,7 +590,13 @@ static inline void primeDispatchEntry(u32 vaddr, u32 sh4_code_size, u32 table_id
+ // Verdict history: v4 (trap-mediated bridge) broke JGR immediately;
+ // v5 (no int-check) broke JGR after soak. Each build gets user-eyes verdict.
+ #define FLY_DEFER_ON 1
+-static const bool g_defer_runtime = FLY_DEFER_ON;
++// Deterministic mode (determinism probe, PLAN_V2 2.5): when set by the
++// host, every compile is synchronous and the chain sweep is off, so no
++// guest-visible choice depends on wall-clock budgets or on when async
++// compiles resolve. Off by default.
++static bool g_fly_det = false;
++extern "C" void fly_set_deterministic(int on) { g_fly_det = on != 0; }
++#define g_defer_runtime (FLY_DEFER_ON && !g_fly_det)
+ #define FLY_FRAME_BUDGET_MS 24.0
+ static double g_frame_start_ms = 0;   // stamped at mainloop entry
+ static inline bool fly_frame_over_budget() {
+@@ -5976,6 +5982,7 @@ public:
+ 		// working set is un-chained (DOA2 measured ~7000 chains needed per
+ 		// fight-mode switch — 20-30s at the old throttle), trickle when caught
+ 		// up. A wall-time cap bounds main-thread byte-building either way.
++		if (!g_fly_det)
+ 		{
+ 			static std::vector<u32> cs_sweep;
+ 			static size_t cs_pos = 0;
+@@ -6068,6 +6075,7 @@ public:
+ 		// SHADOW FARM PATH — the original sync pipeline, kept intact so
+ 		// differential results stay comparable across campaigns. (Not compiled
+ 		// in region-farm builds: chain machinery must stay fully idle there.)
++		if (!g_fly_det)
+ 		{
+ 			static std::vector<u32> cs_sweep;
+ 			static size_t cs_pos = 0;
+-- 
+2.56.0.windows.3
+

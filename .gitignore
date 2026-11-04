@@ -1,0 +1,23 @@
+# Build output and toolchains
+build/
+emsdk/
+node_modules/
+
+# ROM, card and save data: never in Git
+*.ic22
+*.zip
+*.bin
+*.nvmem
+*.card
+*.chd
+
+# Compiled artefacts
+*.wasm
+*.a
+*.o
+
+# Screenshots from runs
+run-logs/**/*.png
+
+# Run tool output (host/tools write to ../run-logs from a checkout): never in Git
+run-logs/

@@ -1,0 +1,100 @@
+From 3f5774aacd48e313905717e3b037625e1fe6e7b0 Mon Sep 17 00:00:00 2001
+From: John R Reeves III <johnreevesiii@outlook.com>
+Date: Mon, 2 Nov 2026 07:18:38 -0800
+Subject: [PATCH 07/22] rec-wasm: use the platform RAM mask in the inline RAM
+ fast paths
+
+wasm_emit.h hardcoded the Dreamcast 16 MB RAM mask (0x00FFFFFF) at the
+five inline RAM load and store sites, and the matching page mask
+(0x00FFF000) at the two page generation bumps. NAOMI has 32 MB
+(settings.platform.ram_mask = 0x01FFFFFF), so accesses to the upper
+16 MB aliased onto the lower half, and stores there bumped the wrong
+page generation counter, so self-modifying code checks missed them.
+Derby Owners Club stalled on a black screen after the NAOMI logo.
+
+Emit RAM_MASK, and RAM_MASK with the low 12 bits cleared, read at code
+generation time. Dreamcast output is unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MGX7KQ5gfrWApgW64pZbQ5
+---
+ core/rec-wasm/wasm_emit.h | 16 ++++++++--------
+ 1 file changed, 8 insertions(+), 8 deletions(-)
+
+diff --git a/core/rec-wasm/wasm_emit.h b/core/rec-wasm/wasm_emit.h
+index 8ccc545be..9753e7156 100644
+--- a/core/rec-wasm/wasm_emit.h
++++ b/core/rec-wasm/wasm_emit.h
+@@ -761,7 +761,7 @@ static bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
+ 				b.op_local_get(LOCAL_CTX);
+ 				b.op_local_get(LOCAL_RAM);
+ 				b.op_local_get(LOCAL_TMP2);
+-				b.op_i32_const(0x00FFFFFF);
++				b.op_i32_const((s32)RAM_MASK);
+ 				b.op_i32_and();
+ 				b.op_i32_add();
+ 				b.op_i32_load(0);
+@@ -772,7 +772,7 @@ static bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
+ 				b.op_local_get(LOCAL_TMP2);
+ 				b.op_i32_const(4);
+ 				b.op_i32_add();
+-				b.op_i32_const(0x00FFFFFF);
++				b.op_i32_const((s32)RAM_MASK);
+ 				b.op_i32_and();
+ 				b.op_i32_add();
+ 				b.op_i32_load(0);
+@@ -824,7 +824,7 @@ static bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
+ 			{
+ 				b.op_local_get(LOCAL_RAM);
+ 				b.op_local_get(LOCAL_TMP);
+-				b.op_i32_const(0x00FFFFFF);
++				b.op_i32_const((s32)RAM_MASK);
+ 				b.op_i32_and();
+ 				b.op_i32_add();
+ 				switch (op.size) {
+@@ -959,7 +959,7 @@ static bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
+ 					// ram[phys & RAM_MASK] = ctx[rs2]
+ 					b.op_local_get(LOCAL_RAM);
+ 					b.op_local_get(LOCAL_TMP2);
+-					b.op_i32_const(0x00FFFFFF);
++					b.op_i32_const((s32)RAM_MASK);
+ 					b.op_i32_and();
+ 					b.op_local_tee(LOCAL_TMP2);   // TMP2 = ram offset now
+ 					b.op_i32_add();
+@@ -980,7 +980,7 @@ static bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
+ 						extern u32 g_fly_page_gen[];
+ 						u32 genBase = (u32)(uintptr_t)&g_fly_page_gen[0];
+ 						b.op_local_get(LOCAL_TMP2);
+-						b.op_i32_const(0x00FFF000);
++						b.op_i32_const((s32)(RAM_MASK & ~0xFFFu));
+ 						b.op_i32_and();
+ 						b.op_i32_const(10);
+ 						b.op_i32_shr_u();
+@@ -1084,7 +1084,7 @@ static bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
+ 			{
+ 				b.op_local_get(LOCAL_RAM);
+ 				b.op_local_get(LOCAL_TMP);
+-				b.op_i32_const(0x00FFFFFF);
++				b.op_i32_const((s32)RAM_MASK);
+ 				b.op_i32_and();
+ 				b.op_i32_add();
+ 				emitLoadParamCached(b, op.rs2, cache);
+@@ -1095,13 +1095,13 @@ static bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
+ 				}
+ #if FLY_EMIT_GEN_BUMP
+ 				// g_fly_page_gen[(phys & RAM_MASK) >> 12]++ — cell byte
+-				// offset collapses to (phys & 0xFFF000) >> 10. TMP still
++				// offset collapses to (phys & RAM_MASK & ~0xFFF) >> 10. TMP still
+ 				// holds phys; TMP2 is free in this arm.
+ 				{
+ 					extern u32 g_fly_page_gen[];
+ 					u32 genBase = (u32)(uintptr_t)&g_fly_page_gen[0];
+ 					b.op_local_get(LOCAL_TMP);
+-					b.op_i32_const(0x00FFF000);
++					b.op_i32_const((s32)(RAM_MASK & ~0xFFFu));
+ 					b.op_i32_and();
+ 					b.op_i32_const(10);
+ 					b.op_i32_shr_u();
+-- 
+2.56.0.windows.3
+

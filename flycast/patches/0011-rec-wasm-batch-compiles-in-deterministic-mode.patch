@@ -1,0 +1,127 @@
+From 50d536a579439612ea2458dda1f478cb1ee0f68a Mon Sep 17 00:00:00 2001
+From: John R Reeves III <johnreevesiii@outlook.com>
+Date: Mon, 2 Nov 2026 08:03:19 -0800
+Subject: [PATCH 11/22] rec-wasm: batch compiles in deterministic mode
+
+fly_set_deterministic(1) made every compile synchronous, one
+WebAssembly.Module per block. Per-module overhead dominates small
+compiles, so boot and scene loads paid many short stalls and the steady
+frame cost was higher than the default mode.
+
+Mode 1 now queues every miss for the batched sync compile (one Module
+per flush) and bridges queued blocks through SHIL until then. Flush
+points depend only on guest execution: mainloop entry (a guest frame
+boundary), a queue depth of FLY_STORM_FLUSH_DEPTH, and a queued block
+passing FLY_HOT_DEFER_THRESHOLD dispatches in the frame. No wall-clock
+budget and no async compile is consulted. Mode 2 keeps the previous
+one-sync-compile-per-block behaviour for comparison. Batched compiles
+now add their time to Module._prof.compileMs.
+
+Lockstep drbyocwc, 9000 frames, mode 1: Chromium against Chromium and
+Chromium against Firefox give identical RAM and register hashes at
+every sample.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MGX7KQ5gfrWApgW64pZbQ5
+---
+ core/rec-wasm/rec_wasm.cpp | 52 +++++++++++++++++++++++++++++++-------
+ 1 file changed, 43 insertions(+), 9 deletions(-)
+
+diff --git a/core/rec-wasm/rec_wasm.cpp b/core/rec-wasm/rec_wasm.cpp
+index 9b4bc11b9..70d5fe058 100644
+--- a/core/rec-wasm/rec_wasm.cpp
++++ b/core/rec-wasm/rec_wasm.cpp
+@@ -590,13 +590,21 @@ static inline void primeDispatchEntry(u32 vaddr, u32 sh4_code_size, u32 table_id
+ // Verdict history: v4 (trap-mediated bridge) broke JGR immediately;
+ // v5 (no int-check) broke JGR after soak. Each build gets user-eyes verdict.
+ #define FLY_DEFER_ON 1
+-// Deterministic mode (determinism probe, PLAN_V2 2.5): when set by the
+-// host, every compile is synchronous and the chain sweep is off, so no
+-// guest-visible choice depends on wall-clock budgets or on when async
+-// compiles resolve. Off by default.
+-static bool g_fly_det = false;
+-extern "C" void fly_set_deterministic(int on) { g_fly_det = on != 0; }
+-#define g_defer_runtime (FLY_DEFER_ON && !g_fly_det)
++// Deterministic mode (determinism probe, PLAN_V2 2.5; D-062 item 6): when
++// set by the host, no guest-visible choice depends on wall-clock budgets or
++// on when async compiles resolve, and the chain sweep is off.
++//   1 = batched (default deterministic policy): every miss is decoded and
++//       queued for the batched sync compile and bridges until the flush.
++//       The flush points depend only on guest execution: mainloop entry
++//       (a guest frame boundary), a queue depth of FLY_STORM_FLUSH_DEPTH,
++//       and a queued block passing FLY_HOT_DEFER_THRESHOLD dispatches in
++//       the frame. One Module per flush instead of one per block.
++//   2 = per-block: every compile synchronous, one Module per block (the
++//       first deterministic mode; slower, kept for comparison).
++// 0 (off) keeps the wall-clock budgets and async compiles.
++static int g_fly_det = 0;
++extern "C" void fly_set_deterministic(int on) { g_fly_det = (on < 0 || on > 2) ? 1 : on; }
++#define g_defer_runtime (FLY_DEFER_ON && g_fly_det != 2)
+ #define FLY_FRAME_BUDGET_MS 24.0
+ static double g_frame_start_ms = 0;   // stamped at mainloop entry
+ static inline bool fly_frame_over_budget() {
+@@ -3379,6 +3387,8 @@ EM_JS(void, wasm_compile_block_async, (const u8* bytesPtr, u32 len, u32 block_pc
+ // failure. Legal on the main thread in all engines (Chrome's 4KB sync limit was
+ // removed in ~114); cost ≈ one module overhead + Liftoff codegen.
+ EM_JS(int, wasm_compile_block_batch, (const u8* bytesPtr, u32 len, const u32* pcsPtr, u32 count, u32* outIdxPtr), {
++	if (!Module._prof) Module._prof = { compileMs: 0, execMs: 0, execSamples: 0, execCount: 0 };
++	var t0 = performance.now();
+ 	try {
+ 		if (!Module._jitImportsResolved) {
+ 			Module._wasm_mem_read8(0);
+@@ -3433,6 +3443,7 @@ EM_JS(int, wasm_compile_block_batch, (const u8* bytesPtr, u32 len, const u32* pc
+ 			Module._wasmBlockIdx[pc] = idx;
+ 			Module.HEAPU32[(outIdxPtr >> 2) + i] = idx;
+ 		}
++		Module._prof.compileMs += performance.now() - t0;
+ 		return count;
+ 	} catch (e) {
+ 		if (!Module._flyQ) console.error('[batch] compile fail n=' + count + ': ' + (e && e.message));
+@@ -6705,7 +6716,26 @@ public:
+ 										// 150-200ms lost). Do not lower this again.
+ 										double fly_sync_budget = (g_bridged_this_frame > FLY_STORM_BRIDGED_THRESHOLD)
+ 										                         ? 50.0 : FLY_SYNC_COMPILE_BUDGET_MS;
+-										if (!g_defer_runtime
++										if (g_fly_det == 1) {
++											// Deterministic batched policy: only guest
++											// execution counts decide. A hot queued block
++											// flushes the whole queue (it is in it); a
++											// block not queued (dropped at a flush as
++											// stale, or replaced) is decoded and queued.
++											double t0 = emscripten_get_now();
++											if (g_batch_pending.count(miss_pc)) {
++												if (force_hot)
++													flushBlockBatch();
++											} else {
++												g_compile_defer = true;
++												g_compile_batch = true;
++												rdv_FailedToFindBlock(miss_pc);
++												g_compile_batch = false;
++												g_compile_defer = false;
++												compilesThisFrame++;
++											}
++											compileTimeThisFrame += (emscripten_get_now() - t0);
++										} else if (!g_defer_runtime
+ 										    || (force_hot && compileTimeThisFrame < fly_sync_budget)) {
+ 											double t0 = emscripten_get_now();
+ 											rdv_FailedToFindBlock(miss_pc);
+@@ -6811,11 +6841,15 @@ public:
+ 								// slog was hundreds of frames of exactly that. Over
+ 								// frame budget they fall to plain async.
+ 								g_compile_defer = g_defer_runtime;
+-								g_compile_batch = g_defer_runtime && !fly_frame_over_budget();
++								// Deterministic batched mode never consults the
++								// wall clock: it always queues (no async compiles).
++								g_compile_batch = g_defer_runtime && (g_fly_det == 1 || !fly_frame_over_budget());
+ 								rdv_FailedToFindBlock(miss_pc);
+ 								g_compile_batch = false;
+ 								g_compile_defer = false;
+ 								compilesThisFrame++;
++								if (g_fly_det == 1 && g_batch_blocks.size() >= FLY_STORM_FLUSH_DEPTH)
++									flushBlockBatch();
+ 								it = blockByVaddr.find(miss_pc);
+ 								compileTimeThisFrame += (emscripten_get_now() - t0);
+ 								if (it != blockByVaddr.end()) {
+-- 
+2.56.0.windows.3
+

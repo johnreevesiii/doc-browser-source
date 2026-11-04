@@ -1,0 +1,81 @@
+From 88d534be4a2c62a21b13fa0236775628cb715df2 Mon Sep 17 00:00:00 2001
+From: John R Reeves III <johnreevesiii@outlook.com>
+Date: Mon, 2 Nov 2026 12:21:58 -0800
+Subject: [PATCH 5/9] linkbus: host-set multiboard board id for the libretro
+ build
+
+The libretro build does not compile core/cfg/cfg.cpp, so the Multiboard
+constructor's config::loadInt("naomi", "BoardId") was an undefined
+symbol once LINKBUS_MULTIBOARD turned the class on. Under LIBRETRO the
+board id now comes from linkbus::multiboardBoardId(), which the host
+sets with linkbus::setMultiboardBoardId() before loading the game (0 =
+master, 1 = graphics partner; default 0). Native builds still read
+naomi:BoardId from the config.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MGX7KQ5gfrWApgW64pZbQ5
+---
+ core/hw/naomi/multiboard.cpp |  5 +++++
+ core/network/linkbus.cpp     | 10 ++++++++++
+ core/network/linkbus.h       |  7 +++++++
+ 3 files changed, 22 insertions(+)
+
+diff --git a/core/hw/naomi/multiboard.cpp b/core/hw/naomi/multiboard.cpp
+index 5b53368ac..a16950b9c 100644
+--- a/core/hw/naomi/multiboard.cpp
++++ b/core/hw/naomi/multiboard.cpp
+@@ -631,7 +631,12 @@ Multiboard::Multiboard()
+ {
+ 	Instance = this;
+ 
++#ifdef LIBRETRO
++	// No config file in the libretro build: the host sets the board id.
++	boardId = linkbus::multiboardBoardId();
++#else
+ 	boardId = config::loadInt("naomi", "BoardId");
++#endif
+ 	const linkbus::MultiboardFactory& factory = linkbus::multiboardFactory();
+ 	if (factory)
+ 	{
+diff --git a/core/network/linkbus.cpp b/core/network/linkbus.cpp
+index 45d218d3e..518374bb1 100644
+--- a/core/network/linkbus.cpp
++++ b/core/network/linkbus.cpp
+@@ -58,6 +58,16 @@ const MultiboardFactory& multiboardFactory() {
+ 	return installedMultiboardFactory;
+ }
+ 
++static int hostBoardId;
++
++void setMultiboardBoardId(int boardId) {
++	hostBoardId = boardId;
++}
++
++int multiboardBoardId() {
++	return hostBoardId;
++}
++
+ // ---------------------------------------------------------------------------
+ // Wire checks
+ // ---------------------------------------------------------------------------
+diff --git a/core/network/linkbus.h b/core/network/linkbus.h
+index fc89f717c..7f55e22dc 100644
+--- a/core/network/linkbus.h
++++ b/core/network/linkbus.h
+@@ -482,6 +482,13 @@ using MultiboardFactory = std::function<std::unique_ptr<MultiboardBackend>(int b
+ void setMultiboardFactory(MultiboardFactory factory);
+ const MultiboardFactory& multiboardFactory();
+ 
++// Board id for the libretro build, which has no config file and never reads
++// naomi:BoardId (core/cfg/cfg.cpp is not compiled under LIBRETRO). The host
++// sets it before loading the game (0 = master, 1 = graphics partner); other
++// builds read naomi:BoardId from the config as before.
++void setMultiboardBoardId(int boardId);
++int multiboardBoardId();
++
+ // In-process cabinet (both boards in one process, threads or one thread for
+ // tests). Barrier semantics: a generation barrier over the boards in
+ // boardMask, as the SAB backend, except that a board that times out keeps its
+-- 
+2.56.0.windows.3
+

@@ -1,0 +1,96 @@
+From 2a4e78b680721b088a4878309a9b0375999cc4a9 Mon Sep 17 00:00:00 2001
+From: John R Reeves III <johnreevesiii@outlook.com>
+Date: Mon, 2 Nov 2026 08:51:21 -0800
+Subject: [PATCH 19/22] rec-wasm: per-read clock jitter and a bridge-charge
+ test hook
+
+The first clock jitter accumulated its skew, so after a few reads every
+elapsed time was over every budget in both seeds and mode 0 made the
+same choices either way. It now adds a fresh 0 to max_us offset to each
+read.
+
+Even so, mode 0 stayed identical across seeds over 3000 frames of
+drbyocwc while its compiled block counts differed: since the idle
+fast-forward fix, whether a block runs compiled, bridged or chained no
+longer shows in guest state on its own. fly_test_bridge_charge(n)
+charges n extra cycles per bridged block, which makes that choice
+visible in guest timing. With it, two mode 0 runs with different
+jitter seeds diverge at the first sample (frame 60), and two mode 1
+runs stay identical at all 51 samples. Both hooks are off by default.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MGX7KQ5gfrWApgW64pZbQ5
+---
+ core/rec-wasm/rec_wasm.cpp | 29 +++++++++++++++++++----------
+ 1 file changed, 19 insertions(+), 10 deletions(-)
+
+diff --git a/core/rec-wasm/rec_wasm.cpp b/core/rec-wasm/rec_wasm.cpp
+index 4d69bdd68..d14c5a3b1 100644
+--- a/core/rec-wasm/rec_wasm.cpp
++++ b/core/rec-wasm/rec_wasm.cpp
+@@ -605,28 +605,25 @@ static inline void primeDispatchEntry(u32 vaddr, u32 sh4_code_size, u32 table_id
+ static int g_fly_det = 0;
+ extern "C" void fly_set_deterministic(int on) { g_fly_det = (on < 0 || on > 2) ? 1 : on; }
+ // Wall clock for every budget and timing decision in this file. Test hook:
+-// fly_test_clock_jitter(seed, max_us) adds a growing pseudo-random skew (0
+-// to max_us per read, from a seeded LCG) so two runs with different seeds
+-// see different elapsed times. Mode 0 budgets then decide differently and
+-// the guest diverges; mode 1 must not, because it consults no wall-clock
+-// budget (the determinism-jitter test checks both). Off (max_us 0) by
++// fly_test_clock_jitter(seed, max_us) adds a pseudo-random offset of 0 to
++// max_us (from a seeded LCG, drawn afresh on every read) so two runs with
++// different seeds see different elapsed times. Mode 0 budgets then decide
++// differently per seed; mode 1 must not, because it consults no wall-clock
++// budget (host/tools/det-jitter-test.mjs checks both). Off (max_us 0) by
+ // default, then fly_now() is emscripten_get_now().
+ static u32 g_fly_clock_jitter_seed = 0;
+ static u32 g_fly_clock_jitter_max_us = 0;
+-static double g_fly_clock_skew_ms = 0;
+ extern "C" void EMSCRIPTEN_KEEPALIVE fly_test_clock_jitter(u32 seed, u32 max_us)
+ {
+ 	g_fly_clock_jitter_seed = seed;
+ 	g_fly_clock_jitter_max_us = max_us;
+-	g_fly_clock_skew_ms = 0;
+ }
+ static inline double fly_now()
+ {
+ 	double t = emscripten_get_now();
+ 	if (g_fly_clock_jitter_max_us) {
+ 		g_fly_clock_jitter_seed = g_fly_clock_jitter_seed * 1664525u + 1013904223u;
+-		g_fly_clock_skew_ms += (double)((g_fly_clock_jitter_seed >> 8) % (g_fly_clock_jitter_max_us + 1)) / 1000.0;
+-		t += g_fly_clock_skew_ms;
++		t += (double)((g_fly_clock_jitter_seed >> 8) % (g_fly_clock_jitter_max_us + 1)) / 1000.0;
+ 	}
+ 	return t;
+ }
+@@ -2383,6 +2380,18 @@ static void cpp_execute_block(RuntimeBlockInfo* block) {
+ // telemetry counts blocks whose fallback execution charged differently than
+ // guest_cycles — evidence for whether normalization matches the emitted
+ // path's charging (emitted blocks add dynamic memory-access penalties).
++// Test hook (host/tools/det-jitter-test.mjs): extra cycles charged per
++// bridged block. 0 (the default) changes nothing. With it set, how many
++// blocks ran bridged rather than compiled becomes visible in guest timing,
++// so a run whose bridge/compile choice depends on the wall clock (mode 0)
++// diverges between runs, and one whose choice depends only on guest
++// execution (mode 1) must not.
++static u32 g_fly_test_bridge_extra = 0;
++extern "C" void EMSCRIPTEN_KEEPALIVE fly_test_bridge_charge(u32 extra_cycles)
++{
++	g_fly_test_bridge_extra = extra_cycles;
++}
++
+ static void fly_bridge_execute(RuntimeBlockInfo* block)
+ {
+ 	Sh4Context& ctx = Sh4cntx;
+@@ -2390,7 +2399,7 @@ static void fly_bridge_execute(RuntimeBlockInfo* block)
+ 	ctx.cycle_counter -= block->guest_cycles;
+ 	for (u32 i = 0; i < block->oplist.size(); i++)
+ 		wasm_exec_shil_fb(block->vaddr, i);
+-	ctx.cycle_counter = cc_pre - (int)block->guest_cycles;
++	ctx.cycle_counter = cc_pre - (int)block->guest_cycles - (int)g_fly_test_bridge_extra;
+ 	applyBlockExitCpp(block);
+ 	fly_bridge_idle_ff(block);
+ }
+-- 
+2.56.0.windows.3
+

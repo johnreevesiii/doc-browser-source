@@ -1,0 +1,190 @@
+From 173e586612b85e211fec2655586a53c674f12867 Mon Sep 17 00:00:00 2001
+From: John R Reeves III <johnreevesiii@outlook.com>
+Date: Mon, 2 Nov 2026 12:10:13 -0800
+Subject: [PATCH 4/9] linkbus: hub learns the slot size from the master (review
+ R1, R2)
+
+Review R1 (delta review of c9be11a7c): InMemoryHub learned the slot size
+from whichever bound seat sent first, so a seat that sent a valid frame
+with a different slot size first locked out the honest seats as BadSize.
+The hub now learns it only from the master's (node 0) first accepted
+frame. A satellite frame that arrives before it is refused as BadSize,
+counted in the new InMemoryHub::Stats::beforeMaster (also in badSize),
+and not recorded, so its localFrame is still new later.
+
+Review R2 (documentation only): the linkbus_web.cpp header said that
+Multiboard falls back to its default when the cabinet buffer is too
+small. In fact makeSabMultiboardBackend returns nullptr and the
+Multiboard constructor throws "Cannot initialize Naomi multiboard
+LinkBus backend"; under Emscripten there is no default.
+
+Tests: four hub tests now send a master frame first; new test
+reviewR1_hub_learns_slot_size_from_master (31 tests, 4185 checks).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MGX7KQ5gfrWApgW64pZbQ5
+---
+ core/network/linkbus.cpp       | 11 +++++++++
+ core/network/linkbus.h         |  8 +++++--
+ core/network/linkbus_web.cpp   |  6 +++--
+ tests/linkbus/linkbus_test.cpp | 44 ++++++++++++++++++++++++++++++++++
+ 4 files changed, 65 insertions(+), 4 deletions(-)
+
+diff --git a/core/network/linkbus.cpp b/core/network/linkbus.cpp
+index 4aea7ca89..45d218d3e 100644
+--- a/core/network/linkbus.cpp
++++ b/core/network/linkbus.cpp
+@@ -313,6 +313,17 @@ struct InMemoryHub::Impl
+ 			stats.replayed++;
+ 			return FrameCheck::BadHeader;
+ 		}
++		// Review R1: the slot size is learned only from the master (node 0),
++		// never from whichever seat happens to send first. A satellite frame
++		// that arrives before the master's first frame is refused as BadSize
++		// (counted in beforeMaster) and not recorded, so a seat with a valid
++		// but different slot size cannot lock out the honest seats.
++		if (slotSize == 0 && h.nodeId != 0)
++		{
++			stats.badSize++;
++			stats.beforeMaster++;
++			return FrameCheck::BadSize;
++		}
+ 		haveLocal[h.nodeId] = true;
+ 		lastLocal[h.nodeId] = h.localFrame;
+ 		slotSize = h.slotSize;
+diff --git a/core/network/linkbus.h b/core/network/linkbus.h
+index 60c724542..fc89f717c 100644
+--- a/core/network/linkbus.h
++++ b/core/network/linkbus.h
+@@ -244,8 +244,8 @@ struct WireExpect
+ {
+ 	Edition edition = Edition::Unknown;
+ 	u32 sessionTag = 0;
+-	int slotCount = 0;		// 0 = not checked (hub learns it from the first frame)
+-	u32 slotSize = 0;		// 0 = not checked
++	int slotCount = 0;		// 0 = not checked
++	u32 slotSize = 0;		// 0 = not checked (the hub learns it from the master's first frame)
+ 	int targetNode = -1;	// assembled frames only; -1 = not checked
+ };
+ 
+@@ -327,6 +327,9 @@ public:
+ 	// the bytes arrived from), never taken from the frame: a frame whose
+ 	// nodeId differs is refused as BadHeader. A frame whose localFrame is not
+ 	// newer than the last one accepted from that node is refused as a replay.
++	// The slot size is learned from the master's (node 0) first accepted
++	// frame only; satellite frames before it are refused as BadSize and
++	// counted in Stats::beforeMaster (review R1).
+ 	FrameCheck submit(int fromNode, const u8 *bytes, u32 size);
+ 	u32 hubTick() const;
+ 	// Tests only, before any frame: start the hub tick at `tick` (wraparound).
+@@ -339,6 +342,7 @@ public:
+ 		u32 badSize = 0;
+ 		u32 badHeader = 0;		// includes a nodeId that is not the sender's
+ 		u32 replayed = 0;		// localFrame not newer than the last accepted
++		u32 beforeMaster = 0;	// satellite frames refused before the master's first (also in badSize)
+ 	};
+ 	Stats stats() const;
+ 
+diff --git a/core/network/linkbus_web.cpp b/core/network/linkbus_web.cpp
+index 3fe429dc2..b66582bdd 100644
+--- a/core/network/linkbus_web.cpp
++++ b/core/network/linkbus_web.cpp
+@@ -29,8 +29,10 @@
+ 
+ 	Both buffers must be SharedArrayBuffers at least as large as the layout
+ 	(MailboxLayout::totalBytes, MultiboardSabLayout::totalBytes); otherwise
+-	linkbus_install_mailbox returns 3 and the SAB multiboard backend is not
+-	created (Multiboard falls back to its default).
++	linkbus_install_mailbox returns 3, and makeSabMultiboardBackend returns
++	nullptr, so the Multiboard constructor throws "Cannot initialize Naomi
++	multiboard LinkBus backend" (a clear refusal; under Emscripten there is
++	no shared memory default to fall back to).
+ 
+ 	  Messages posted by the core:
+ 	    { type: 'linkbus-tx', seq }                       after each slot frame
+diff --git a/tests/linkbus/linkbus_test.cpp b/tests/linkbus/linkbus_test.cpp
+index 13646c3e8..a0386f786 100644
+--- a/tests/linkbus/linkbus_test.cpp
++++ b/tests/linkbus/linkbus_test.cpp
+@@ -799,6 +799,8 @@ TEST(review5_hub_binds_sender_to_seat)
+ 	InMemoryHub hub(n, Edition::A, 0, 77);
+ 	auto s0 = hub.attach(0), s1 = hub.attach(1);
+ 	std::vector<u8> tx(S * n, 0x12);
++	std::vector<u8> mtx(S * n, 0x01);
++	s0->publish(mtx.data(), S, n, 4);	// master first: sets the slot size (review R1)
+ 	s1->publish(tx.data(), S, n, 5);
+ 	// Seat 0's transport carries a frame claiming to be node 1 (same tick).
+ 	auto imp = slotFrameLf(1, n, S, 1000, 0x77);
+@@ -823,6 +825,9 @@ TEST(review5_hub_refuses_replay)
+ 	const int n = 3;
+ 	InMemoryHub hub(n, Edition::A, 0, 77);
+ 	auto s0 = hub.attach(0);
++	// The master's first frame sets the slot size (review R1).
++	auto m = slotFrameLf(0, n, S, 0, 0x40);
++	CHECK(hub.submit(0, m.data(), (u32)m.size()) == FrameCheck::Ok);
+ 	auto f = slotFrameLf(1, n, S, 3, 0x41);
+ 	CHECK(hub.submit(1, f.data(), (u32)f.size()) == FrameCheck::Ok);
+ 	hub.tick();
+@@ -865,6 +870,7 @@ TEST(review6_hub_delay_clamped)
+ 	InMemoryHub hub(n, Edition::A, 0xFFFFFFFFu, 77);
+ 	auto s0 = hub.attach(0), s1 = hub.attach(1);
+ 	std::vector<u8> tx(S * n, 0x12);
++	s0->publish(tx.data(), S, n, 4);	// master first: sets the slot size (review R1)
+ 	s1->publish(tx.data(), S, n, 5);
+ 	GuardedRx rx(S, n);
+ 	u32 firstFresh = 0;
+@@ -888,6 +894,12 @@ TEST(review6_hub_tick_wraparound_matches_unwrapped)
+ 	auto p0 = plain.attach(0), p1 = plain.attach(1);
+ 	auto w0 = wrap.attach(0), w1 = wrap.attach(1);
+ 	std::vector<u8> rxp(S * n, 0), rxw(S * n, 0);
++	{
++		// Master first: sets the slot size (review R1). Same stamp as g = 0.
++		std::vector<u8> tx(S * n, 0x5A);
++		p0->publish(tx.data(), S, n, 0);
++		w0->publish(tx.data(), S, n, 0);
++	}
+ 	bool same = true;
+ 	u32 freshCount = 0;
+ 	for (u32 g = 0; g < 40; g++)
+@@ -1215,6 +1227,38 @@ TEST(review_mailbox_hostile_frames_leave_rx_untouched)
+ 	CHECK(rx.canariesIntact());
+ }
+ 
++
++// Review R1: the hub learns the slot size from the master only. A satellite
++// that sends a valid frame with a different slot size first must not lock
++// out the honest seats.
++TEST(reviewR1_hub_learns_slot_size_from_master)
++{
++	const u32 S = 0x20;
++	const int n = 3;
++	InMemoryHub hub(n, Edition::A, 0, 77);
++	auto s0 = hub.attach(0);
++	auto odd = slotFrameLf(2, n, 0x10, 0, 0x21);
++	CHECK(hub.submit(2, odd.data(), (u32)odd.size()) == FrameCheck::BadSize);
++	auto early = slotFrameLf(1, n, S, 0, 0x22);
++	CHECK(hub.submit(1, early.data(), (u32)early.size()) == FrameCheck::BadSize);
++	CHECK_EQ(hub.stats().beforeMaster, 2u);
++	CHECK_EQ(hub.stats().accepted, 0u);
++	auto m = slotFrameLf(0, n, S, 0, 0x40);
++	CHECK(hub.submit(0, m.data(), (u32)m.size()) == FrameCheck::Ok);
++	// Not recorded before: localFrame 0 is still new for node 1.
++	CHECK(hub.submit(1, early.data(), (u32)early.size()) == FrameCheck::Ok);
++	auto odd2 = slotFrameLf(2, n, 0x10, 1, 0x23);
++	CHECK(hub.submit(2, odd2.data(), (u32)odd2.size()) == FrameCheck::BadSize);
++	auto good2 = slotFrameLf(2, n, S, 1, 0x24);
++	CHECK(hub.submit(2, good2.data(), (u32)good2.size()) == FrameCheck::Ok);
++	CHECK_EQ(hub.stats().beforeMaster, 2u);
++	CHECK_EQ(hub.stats().accepted, 3u);
++	hub.tick();
++	GuardedRx rx(S, n);
++	CHECK(s0->take(rx.base(), S, n, 0).fresh);
++	CHECK(rx.canariesIntact());
++}
++
+ int main()
+ {
+ 	for (auto& t : registry())
+-- 
+2.56.0.windows.3
+

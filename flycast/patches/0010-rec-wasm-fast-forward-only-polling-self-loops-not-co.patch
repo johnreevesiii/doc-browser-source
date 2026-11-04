@@ -1,0 +1,114 @@
+From 4d1c00716cbdcdfa35336351f38e6e08bc2a3685 Mon Sep 17 00:00:00 2001
+From: John R Reeves III <johnreevesiii@outlook.com>
+Date: Mon, 2 Nov 2026 08:03:18 -0800
+Subject: [PATCH 10/22] rec-wasm: fast-forward only polling self-loops, not
+ counted delays
+
+Every conditional self-loop was treated as an idle wait and capped
+cycle_counter at 32 on each back-branch. The NAOMI BIOS delay loops at
+0x0c034b8a and 0x0c034b9e keep their counter on the stack (load, add,
+store, tst, bf back), so each pass was charged up to the rest of a
+timeslice and every delay ran many times longer in guest time than on
+real hardware. Native Flycast dynarecs have no idle skip and charge
+each pass guest_cycles.
+
+The soft fast-forward now applies to unconditional self-loops (waits for
+an interrupt) and to conditional self-loops that read memory and write
+none (polls). The SHIL bridge applies the same rule, so a bridged block
+is charged like its compiled form.
+
+Drbyocwc under lockstep: the game resumes drawing after the NAOMI logo
+at about guest frame 670 instead of about 3210 (interpreter: about 1390).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MGX7KQ5gfrWApgW64pZbQ5
+---
+ core/rec-wasm/rec_wasm.cpp | 57 +++++++++++++++++++++++++++++++-------
+ 1 file changed, 47 insertions(+), 10 deletions(-)
+
+diff --git a/core/rec-wasm/rec_wasm.cpp b/core/rec-wasm/rec_wasm.cpp
+index d57fbbb07..9b4bc11b9 100644
+--- a/core/rec-wasm/rec_wasm.cpp
++++ b/core/rec-wasm/rec_wasm.cpp
+@@ -1518,6 +1518,50 @@ static void applyBlockExitCpp(RuntimeBlockInfo* block) {
+ 	}
+ }
+ 
++// Idle self-loop soft fast-forward (cap cycle_counter at 32 when the block
++// branches back to itself). Native Flycast dynarecs have no idle skip and
++// charge each pass guest_cycles; rec-wasm keeps the skip for real waits only:
++//  - an unconditional self-loop (bra to itself) waits for an interrupt;
++//  - a conditional self-loop qualifies only when it polls: it reads memory
++//    and writes none and has no interpreter-fallback op. A conditional
++//    self-loop that only touches registers, or that keeps its counter in
++//    memory (read, add, write back: the NAOMI BIOS delay loops at
++//    0x0c034b8a and 0x0c034b9e), is a counted delay. Fast-forwarding those
++//    charged up to a timeslice per pass and stretched every BIOS delay
++//    (about 45 guest seconds of boot against about 17 on the interpreter,
++//    which is itself underclocked 8x).
++// Shared by the block emitter and the SHIL bridge so both charge alike.
++static bool fly_block_idle_ff(const RuntimeBlockInfo* block)
++{
++	u32 bcls = BET_GET_CLS(block->BlockType);
++	if (bcls == BET_CLS_Static)
++		return block->BlockType != BET_StaticIntr && block->BranchBlock == block->vaddr;
++	if (bcls != BET_CLS_COND
++	    || (block->BranchBlock != block->vaddr && block->NextBlock != block->vaddr))
++		return false;
++	bool reads = false;
++	for (const shil_opcode& op : block->oplist) {
++		if (op.op == shop_writem || op.op == shop_ifb)
++			return false;
++		if (op.op == shop_readm)
++			reads = true;
++	}
++	return reads;
++}
++
++// Applies the idle soft fast-forward after a bridged (SHIL) execution, the
++// same way the emitted block epilogue does.
++static inline void fly_bridge_idle_ff(const RuntimeBlockInfo* block)
++{
++	Sh4Context& ctx = Sh4cntx;
++	if (!fly_block_idle_ff(block))
++		return;
++	if (BET_GET_CLS(block->BlockType) == BET_CLS_COND && ctx.pc != block->vaddr)
++		return;
++	if (ctx.cycle_counter > 32)
++		ctx.cycle_counter = 32;
++}
++
+ // === MODE SWITCH (defined above ref_execute_block) ===
+ // 0 = ref (per-instruction charging)
+ // 1 = SHIL with guest_offs-based per-instruction charging
+@@ -2103,6 +2147,7 @@ static void fly_bridge_execute(RuntimeBlockInfo* block)
+ 		wasm_exec_shil_fb(block->vaddr, i);
+ 	ctx.cycle_counter = cc_pre - (int)block->guest_cycles;
+ 	applyBlockExitCpp(block);
++	fly_bridge_idle_ff(block);
+ }
+ 
+ #if FLY_BRIDGE_SHADOW
+@@ -4337,17 +4382,9 @@ static void emitBlockFuncBody(WasmModuleBuilder& b, RuntimeBlockInfo* block) {
+ 	RegCache cache;
+ 	cache.scanBlock(block);
+ 
+-	// Idle loop detection: blocks that branch back to themselves
+-	bool is_idle_loop = false;
++	// Idle loop detection: self-loops that wait (see fly_block_idle_ff)
+ 	u32 bcls = BET_GET_CLS(block->BlockType);
+-	if (bcls == BET_CLS_Static && block->BlockType != BET_StaticIntr
+-		&& block->BranchBlock == block->vaddr) {
+-		is_idle_loop = true;
+-	}
+-	if (bcls == BET_CLS_COND
+-		&& (block->BranchBlock == block->vaddr || block->NextBlock == block->vaddr)) {
+-		is_idle_loop = true;
+-	}
++	bool is_idle_loop = fly_block_idle_ff(block);
+ 
+ 	b.beginFuncBody();
+ 
+-- 
+2.56.0.windows.3
+

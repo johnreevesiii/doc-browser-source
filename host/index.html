@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DOC Browser Host</title>
+<!-- GPL-2.0-or-later. Thin libretro host skeleton (PLAN_V2 2.3).
+     Serve with Cross-Origin-Opener-Policy: same-origin and
+     Cross-Origin-Embedder-Policy: require-corp for SharedArrayBuffer. -->
+<style>
+  :root { --bg: #f6f5f2; --fg: #1d1d1b; --muted: #5d5b55; --panel: #ffffff; --line: #d8d5cc; --accent: #2f5d50; }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --bg: #151513; --fg: #ecebe6; --muted: #a8a59c; --panel: #1f1f1c; --line: #3a3934; --accent: #8cc2b0; }
+  }
+  :root[data-theme="dark"] { --bg: #151513; --fg: #ecebe6; --muted: #a8a59c; --panel: #1f1f1c; --line: #3a3934; --accent: #8cc2b0; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, sans-serif; }
+  main { max-width: 1100px; margin: 0 auto; padding: 16px; display: grid; gap: 16px; }
+  h1 { font-size: 1.25rem; margin: 0; }
+  .stage { background: #000; aspect-ratio: 4 / 3; width: 100%; display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 16px; }
+  .muted { color: var(--muted); font-size: 0.9rem; }
+  button { font: inherit; padding: 4px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--fg); cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  ul { padding-left: 18px; margin: 8px 0 0; }
+  li { margin: 4px 0; }
+  [hidden] { display: none !important; }
+  #cabinet .stage canvas { width: 100%; height: 100%; }
+  /* Cabinet mode (a stable game on the five-board cabinet): the lobby seat layout. The race screen (master
+     left half, graphics board right half) across the top half, the player's seat below it filling the rest,
+     a button rail on the right edge and the controls panel nested beside it. */
+  body.cab-mode main > h1, body.cab-mode #single-stage, body.cab-mode #rom-section,
+  body.cab-mode #lab-card-section, body.cab-mode #host-status { display: none !important; }
+  body.cab-mode { overflow: hidden; }
+  #cabinet { position: fixed; inset: 0; z-index: 10; display: flex; flex-direction: column; background: #000;
+    border: 0; border-radius: 0; padding: 0; }
+  #cabinet[hidden] { display: none; }
+  #cabinet .race { flex: 0 0 auto; height: min(50vh, 37.5vw); aspect-ratio: 8 / 3; align-self: center;
+    display: flex; background: #000; }
+  #cabinet .race canvas { flex: 1 1 0; min-width: 0; height: 100%; }
+  #cabinet .seat { flex: 1 1 0; min-height: 0; padding-top: 3px; display: flex; justify-content: center; }
+  #cabinet .seat canvas { height: min(100%, 75vw); aspect-ratio: 4 / 3; width: auto; background: #000; }
+  .cab-rail { position: fixed; top: 8px; right: 10px; z-index: 16; display: flex; flex-direction: column;
+    align-items: center; gap: 8px; }
+  .cab-railbtn { width: 44px; height: 44px; padding: 0; display: flex; align-items: center; justify-content: center;
+    border: 1px solid #3a4652; border-radius: 10px; background: rgba(28, 36, 44, 0.86); color: #ecebe6; cursor: pointer; }
+  .cab-railbtn:hover { border-color: #a8a59c; }
+  .cab-railbtn:focus-visible { outline: 2px solid #8cc2b0; outline-offset: 2px; }
+  .cab-railbtn.on { border-color: #8cc2b0; }
+  .cab-railbtn svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  .cab-railbtn.cab-menu { background: #2f5d50; border-color: #2f5d50; }
+  .cab-railbtn.cab-menu.on { background: #1f1f1c; }
+  .cab-railbtn.cab-leave { margin-top: 10px; background: rgba(236, 106, 47, 0.9); border-color: transparent; color: #fff; }
+  body.cab-mode #stable-panel { position: fixed; top: 8px; right: 64px; z-index: 17; width: min(340px, calc(100vw - 80px));
+    max-height: calc(100dvh - 16px); overflow-y: auto; margin: 0; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5); }
+  body.cab-mode:not(.cab-panel-open) #stable-panel { display: none; }
+  #cab-info .boards canvas { width: 140px; height: 105px; }
+  .cab-chip { position: fixed; left: 10px; bottom: 8px; z-index: 15; max-width: calc(100vw - 80px); padding: 4px 10px;
+    border-radius: 8px; background: rgba(28, 36, 44, 0.8); color: #ecebe6; font-size: 0.8rem; pointer-events: none; }
+  .cab-toast { bottom: 40px; font-size: 0.9rem; border: 1px solid #8cc2b0; }
+  .cab-chip:empty { display: none; }
+  /* Connection trouble: a notice at the top of the screen until an answer comes back. */
+  .conn-banner { position: fixed; top: 8px; left: 50%; transform: translateX(-50%); z-index: 25; max-width: calc(100vw - 140px);
+    margin: 0; padding: 6px 14px; border-radius: 8px; border: 1px solid #ec6a2f; background: rgba(28, 36, 44, 0.94);
+    color: #ecebe6; font-size: 0.95rem; }
+  /* The session can no longer save: the game is stopped and this covers it. */
+  #lost-overlay { position: fixed; inset: 0; z-index: 30; display: flex; align-items: center; justify-content: center;
+    padding: 16px; background: rgba(0, 0, 0, 0.8); }
+  .lost-card { max-width: 480px; padding: 20px; border: 1px solid #3a3934; border-radius: 10px; background: #1f1f1c;
+    color: #ecebe6; text-align: center; }
+  .lost-card h2 { margin: 0 0 8px; font-size: 1.2rem; }
+  .lost-card p { margin: 0 0 16px; }
+  #lost-back { display: inline-block; padding: 10px 18px; border-radius: 8px; background: #8cc2b0; color: #151513;
+    font-weight: 600; text-decoration: none; }
+  #lost-back:focus-visible { outline: 2px solid #ecebe6; outline-offset: 3px; }
+  .cab-mix { display: grid; gap: 4px; margin: 0 0 8px; }
+  .cab-mix .mixrow { display: grid; grid-template-columns: 3.5em 1fr 3.2em; align-items: center; gap: 8px; }
+  .cab-mix .mixrow b { font-weight: 600; text-align: right; font-variant-numeric: tabular-nums; }
+  .cab-mix input[type="range"] { width: 100%; accent-color: var(--accent); }
+  .cab-mix p { margin: 2px 0 0; }
+  .cab-restart { margin: 8px 0; }
+  .cab-confirm { margin-top: 6px; padding: 8px 10px; border: 1px solid #ec6a2f; border-radius: 8px; }
+  .cab-confirm p { margin: 0 0 8px; }
+  .cab-controls { margin-top: 10px; border-top: 1px solid var(--line); padding-top: 8px; }
+  .cab-controls summary { cursor: pointer; font-weight: 600; }
+  .cab-controls table { width: 100%; border-collapse: collapse; margin: 6px 0; font-size: 0.9rem; }
+  .cab-controls th { text-align: left; font-weight: 600; color: var(--muted); padding: 2px 4px; }
+  .cab-controls td { padding: 2px 4px; }
+  .cab-controls td button { width: 100%; text-align: left; padding: 2px 6px; }
+  .cab-controls td button.listening { border-color: var(--accent); outline: 2px solid var(--accent); }
+  .cab-controls button:focus-visible, .cab-restart button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  #pilot-feedback { margin-top: 10px; border-top: 1px solid var(--line); padding-top: 8px; }
+  #pilot-feedback summary { cursor: pointer; font-weight: 600; }
+  #pilot-feedback form { display: grid; gap: 6px; margin-top: 8px; }
+  #fb-note { width: 100%; min-height: 84px; resize: vertical; font: inherit; padding: 6px 8px; border: 1px solid var(--line);
+    border-radius: 6px; background: var(--bg); color: var(--fg); }
+  #fb-note:focus-visible, #fb-send:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  #fb-send { justify-self: start; }
+  /* No hand-off (a reload, or /pilot opened directly): only the way back to the stable. */
+  body.no-handoff main > h1, body.no-handoff #single-stage, body.no-handoff #rom-section, body.no-handoff #lab-card-section,
+  body.no-handoff #host-status, body.no-handoff #stable-panel, body.no-handoff #cabinet { display: none !important; }
+  #no-handoff { max-width: 520px; margin: 12vh auto 0; text-align: center; padding: 24px 20px; }
+  #no-handoff h2 { font-size: 1.3rem; margin: 0 0 8px; }
+  #no-handoff p { margin: 0 0 16px; color: var(--muted); }
+  #no-handoff a { display: inline-block; padding: 10px 18px; border-radius: 8px; background: var(--accent); color: var(--bg);
+    font-weight: 600; text-decoration: none; }
+  #no-handoff a:hover { text-decoration: underline; }
+  #no-handoff a:focus-visible { outline: 2px solid var(--fg); outline-offset: 3px; }
+  .boards { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+  .boards figure { margin: 0; }
+  .boards canvas { width: 240px; height: 180px; background: #000; }
+  .boards figcaption { font-size: 0.8rem; color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1>DOC Browser Host (skeleton)</h1>
+  <section id="no-handoff" hidden aria-labelledby="no-handoff-title">
+    <h2 id="no-handoff-title">Open the game from your stable</h2>
+    <p>The game starts from your stable page. Go to your stable and press Play in browser on one of your browser horses.</p>
+    <a id="no-handoff-link" href="/stable/browser">Go to your stable</a>
+  </section>
+  <section id="stable-panel" hidden aria-label="Your horse">
+    <p><strong id="stable-horse"></strong> <span id="stable-edition" class="muted"></span></p>
+    <p id="stable-status" role="status" aria-live="polite"></p>
+    <button id="stable-start" type="button" hidden>Start</button>
+    <button id="stable-finish" type="button" hidden>Finish and return to stable</button>
+    <a id="stable-back" href="/stable/browser" hidden>Back to your stable</a>
+    <div id="cab-info" hidden>
+      <p id="cab-audio" class="muted"></p>
+      <div id="cab-mix" class="cab-mix" role="group" aria-label="Volume mixer" hidden>
+        <label class="mixrow"><span>Race</span><input id="mix-race" type="range" min="0" max="100" step="1" aria-label="Race audio volume"><b id="mix-race-val"></b></label>
+        <label class="mixrow"><span>Seat</span><input id="mix-seat" type="range" min="0" max="100" step="1" aria-label="Seat sounds volume"><b id="mix-seat-val"></b></label>
+        <p class="muted">Race: the announcer, crowd and music. Seat: your seat's own sounds. Kept on this device; the speaker button mutes both.</p>
+      </div>
+      <p class="muted">Your horse runs on seat 1 of a five-board linked cabinet in this page. Keys (the same as DOC Online unless you change them under Controls): I inserts your card, Z is OK, X is Hold, C is the whip, arrows move, Enter is start. M opens or closes this panel, F is fullscreen. A controller works too.</p>
+      <div id="cab-restart-box" class="cab-restart">
+        <button id="cab-restart" type="button">Restart cabinet</button>
+        <div id="cab-restart-confirm" class="cab-confirm" role="alertdialog" aria-labelledby="cab-restart-q" hidden>
+          <p id="cab-restart-q"></p>
+          <button id="cab-restart-yes" type="button">Restart</button>
+          <button id="cab-restart-no" type="button">Cancel</button>
+        </div>
+      </div>
+      <details>
+        <summary>Other seats</summary>
+        <div class="boards">
+          <figure><canvas id="cab-board2" width="640" height="480"></canvas><figcaption>Seat 2 (no card)</figcaption></figure>
+          <figure><canvas id="cab-board3" width="640" height="480"></canvas><figcaption>Seat 3 (no card)</figcaption></figure>
+          <figure><canvas id="cab-board4" width="640" height="480"></canvas><figcaption>Seat 4 (no card)</figcaption></figure>
+        </div>
+      </details>
+    </div>
+    <details id="cab-controls" class="cab-controls" hidden>
+      <summary>Controls</summary>
+      <p class="muted">Press a button below, then the key or controller button you want. Escape cancels. M, F, Escape and Tab stay the page's own keys. Kept on this device.</p>
+      <table>
+        <thead><tr><th scope="col">Action</th><th scope="col">Key</th><th scope="col">Controller</th></tr></thead>
+        <tbody id="ctl-rows"></tbody>
+      </table>
+      <p id="ctl-status" class="muted" role="status" aria-live="polite"></p>
+      <button id="ctl-reset" type="button">Reset to DOC defaults</button>
+    </details>
+    <details id="pilot-feedback" hidden>
+      <summary>Send feedback</summary>
+      <form id="fb-form">
+        <label for="fb-note">What happened, or what would you change?</label>
+        <textarea id="fb-note" maxlength="1000" rows="4"></textarea>
+        <p class="muted" id="fb-what">Sent with your note: your browser's name and version, the game speed, how many boards loaded, the link state, the last error message on this page and the page version. Nothing else about you or your device.</p>
+        <button id="fb-send" type="submit">Send feedback</button>
+        <p id="fb-status" class="muted" role="status" aria-live="polite"></p>
+      </form>
+    </details>
+  </section>
+  <div class="stage" id="single-stage"><canvas id="screen" width="640" height="480"></canvas></div>
+  <section id="cabinet" hidden aria-label="Cabinet">
+    <div class="race" aria-label="Race screen"><canvas id="cab-board0" width="640" height="480"></canvas><canvas id="cab-partner" width="640" height="480"></canvas></div>
+    <div class="seat" aria-label="Your seat"><canvas id="cab-board1" width="640" height="480"></canvas></div>
+    <div class="cab-rail" role="toolbar" aria-label="Seat controls" aria-orientation="vertical">
+      <button id="cab-sound" class="cab-railbtn on" type="button" title="Sound is on: tap to mute" aria-label="Mute sound"><svg viewBox="0 0 24 24"><path d="M4 9h4l5-4v14l-5-4H4z"/><path d="M16 9a4 4 0 0 1 0 6"/><path d="M18.5 6.5a8 8 0 0 1 0 11"/></svg></button>
+      <button id="cab-full" class="cab-railbtn" type="button" title="Fullscreen or windowed (or press F)" aria-label="Fullscreen"><svg viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg></button>
+      <button id="cab-menu" class="cab-railbtn cab-menu" type="button" title="Your horse, status and keys (M)" aria-label="Seat controls" aria-expanded="false" aria-controls="stable-panel"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg></button>
+      <button id="cab-leave" class="cab-railbtn cab-leave" type="button" title="Finish and return to your stable (saves your horse)" aria-label="Finish and return to stable"><svg viewBox="0 0 24 24"><path d="M10 4H5v16h5"/><path d="M14 8l4 4-4 4M18 12H9"/></svg></button>
+    </div>
+    <p id="cab-toast" class="cab-chip cab-toast" role="status" aria-live="polite"></p>
+    <p id="cab-stats" class="cab-chip" role="status"></p>
+  </section>
+  <p id="conn-banner" class="conn-banner" role="alert" hidden></p>
+  <div id="lost-overlay" role="alertdialog" aria-modal="true" aria-labelledby="lost-title" aria-describedby="lost-msg" hidden>
+    <div class="lost-card">
+      <h2 id="lost-title">Game stopped</h2>
+      <p id="lost-msg"></p>
+      <a id="lost-back" href="/stable/browser">Back to your stable</a>
+    </div>
+  </div>
+  <section id="rom-section">
+    <label for="rom-input"><strong>Your ROM</strong></label>
+    <p class="muted">Pick your own game file. It is copied into this browser's private storage and never uploaded.</p>
+    <input id="rom-input" type="file" accept=".zip,.7z,.chd,.cdi,.gdi,.bin,.elf" multiple>
+    <ul id="rom-list"></ul>
+  </section>
+  <section id="lab-card-section" hidden>
+    <label for="card-input"><strong>Horse card (lab cards only)</strong></label>
+    <p class="muted">Optional. A 207-byte .card file. It is copied into this browser's private storage; when the game writes the card, the new card is saved there too. Nothing is uploaded. Pick the card before booting; press I in the game to insert it.</p>
+    <input id="card-input" type="file" accept=".card">
+    <label for="card-select">Card for the next boot:</label>
+    <select id="card-select"><option value="">(no card)</option></select>
+    <span id="card-status" class="muted"></span>
+  </section>
+  <section id="host-status">
+    <p id="status" role="status">Starting...</p>
+    <p id="isolation" class="muted"></p>
+    <p class="muted">Keys (DOC Online): arrows move, Z OK, X Hold, C whip, I insert card, Enter start. Coin, Test and Service are not available to players.</p>
+  </section>
+</main>
+<script type="module" src="./src/main.js"></script>
+</body>
+</html>

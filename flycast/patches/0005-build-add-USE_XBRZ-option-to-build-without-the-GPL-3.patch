@@ -1,0 +1,89 @@
+From cf248ee5401354a870a3160d90f4b556b5103822 Mon Sep 17 00:00:00 2001
+From: John R Reeves III <johnreevesiii@outlook.com>
+Date: Mon, 2 Nov 2026 06:32:40 -0800
+Subject: [PATCH 05/22] build: add USE_XBRZ option to build without the GPL-3.0
+ xBRZ upscaler
+
+With -DUSE_XBRZ=OFF, core/deps/xbrz/xbrz.cpp is not compiled and
+UpscalexBRZ falls back to nearest-neighbour scaling, so the texture
+upscale option still yields a correctly sized buffer. Default stays ON.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MGX7KQ5gfrWApgW64pZbQ5
+---
+ CMakeLists.txt         |  7 ++++++-
+ core/rend/TexCache.cpp | 18 ++++++++++++++++++
+ 2 files changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 4e5f68889..8db85cd80 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -100,6 +100,7 @@ option(ENABLE_DC_PROFILER "Build with support for target machine (SH4) profiler"
+ option(ENABLE_FC_PROFILER "Build with support for host app (Flycast) profiler" OFF)
+ option(USE_DISCORD "Use Discord Presence API" OFF)
+ option(USE_LIBCDIO "Use libcdio for CDROM access" OFF)
++option(USE_XBRZ "Build the xBRZ texture upscaler (GPL-3.0)" ON)
+ 
+ if(IOS AND NOT LIBRETRO)
+ 	set(USE_VULKAN OFF CACHE BOOL "Force vulkan off" FORCE)
+@@ -941,7 +942,11 @@ if(NOT LIBRETRO)
+ 			core/deps/implot/implot_items.cpp)
+ 	endif()
+ endif()
+-target_sources(${PROJECT_NAME} PRIVATE core/deps/xbrz/xbrz.cpp)
++if(USE_XBRZ)
++	target_sources(${PROJECT_NAME} PRIVATE core/deps/xbrz/xbrz.cpp)
++else()
++	target_compile_definitions(${PROJECT_NAME} PRIVATE NO_XBRZ)
++endif()
+ target_sources(${PROJECT_NAME} PRIVATE core/deps/md5/md5.cpp)
+ 
+ if(USE_DISCORD AND NOT LIBRETRO)
+diff --git a/core/rend/TexCache.cpp b/core/rend/TexCache.cpp
+index 74a60c4dd..ff532e6e5 100644
+--- a/core/rend/TexCache.cpp
++++ b/core/rend/TexCache.cpp
+@@ -15,7 +15,9 @@
+     along with Flycast.  If not, see <https://www.gnu.org/licenses/>.
+ */
+ #include "TexCache.h"
++#ifndef NO_XBRZ
+ #include "xbrz/xbrz.h"
++#endif
+ #include "hw/pvr/pvr_mem.h"
+ #include "hw/mem/addrspace.h"
+ 
+@@ -152,6 +154,21 @@ void parallelize(Func func, int start, int end)
+ }
+ #endif
+ 
++#ifdef NO_XBRZ
++// Built without xBRZ (GPL-3.0): plain nearest-neighbour scaling so callers
++// still get a fully written factor-times-larger buffer.
++void UpscalexBRZ(int factor, u32* source, u32* dest, int width, int height, bool has_alpha)
++{
++	const int dw = width * factor;
++	for (int y = 0; y < height * factor; y++)
++	{
++		const u32 *srow = source + (y / factor) * width;
++		u32 *drow = dest + y * dw;
++		for (int x = 0; x < dw; x++)
++			drow[x] = srow[x / factor];
++	}
++}
++#else
+ static struct xbrz::ScalerCfg xbrz_cfg;
+ 
+ void UpscalexBRZ(int factor, u32* source, u32* dest, int width, int height, bool has_alpha)
+@@ -165,6 +182,7 @@ void UpscalexBRZ(int factor, u32* source, u32* dest, int width, int height, bool
+ 	xbrz::scale(factor, source, dest, width, height, has_alpha ? xbrz::ColorFormat::ARGB : xbrz::ColorFormat::RGB, xbrz_cfg);
+ #endif
+ }
++#endif // NO_XBRZ
+ 
+ extern const u32 VQMipPoint[11] =
+ {
+-- 
+2.56.0.windows.3
+

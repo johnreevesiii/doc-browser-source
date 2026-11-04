@@ -1,0 +1,103 @@
+From c95a2f2ae59ce8e7816c29bb938fbffd2d3c37ae Mon Sep 17 00:00:00 2001
+From: John R Reeves III <johnreevesiii@outlook.com>
+Date: Mon, 2 Nov 2026 06:34:02 -0800
+Subject: [PATCH 06/22] build: add USE_BUNDLED_GAME_DATA option to leave out
+ third-party game data
+
+With -DUSE_BUNDLED_GAME_DATA=OFF the flycast-resources library no longer
+embeds the per-game flash/NVRAM defaults, the F355 print template, the
+printer fonts or the BIOS font. resource::load() already returns nullptr
+for a missing entry; the BIOS font copy and the printer glyph lookup now
+tolerate that. Default stays ON.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MGX7KQ5gfrWApgW64pZbQ5
+---
+ core/hw/naomi/printer.cpp |  6 ++++++
+ core/reios/reios.cpp      |  3 ++-
+ resources/resources.cmake | 11 ++++++++++-
+ 3 files changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/core/hw/naomi/printer.cpp b/core/hw/naomi/printer.cpp
+index e9cf16db1..eb47fed1c 100644
+--- a/core/hw/naomi/printer.cpp
++++ b/core/hw/naomi/printer.cpp
+@@ -531,6 +531,8 @@ private:
+ 		}
+ 	}
+ 
++	static constexpr u8 blankGlyph[3 * 24] {};
++
+ 	const u8 *getGlyph(char c)
+ 	{
+ 		const u8 *glyph;
+@@ -545,6 +547,8 @@ private:
+ 			glyph = ascii8x16.get();
+ 			glyphSize = 16;
+ 		}
++		if (glyph == nullptr)	// font resource not embedded: print blanks
++			return blankGlyph;
+ 		if ((uint8_t)c < ' ')
+ 			return glyph;
+ 		else
+@@ -565,6 +569,8 @@ private:
+ 			glyph = kanji16x16.get();
+ 			glyphSize = 2 * 16;
+ 		}
++		if (glyph == nullptr)	// font resource not embedded: print blanks
++			return blankGlyph;
+ 		if (c == ' ')
+ 			return glyph;
+ 		uint8_t plane = c >> 8;
+diff --git a/core/reios/reios.cpp b/core/reios/reios.cpp
+index 0ecde7993..f82353178 100644
+--- a/core/reios/reios.cpp
++++ b/core/reios/reios.cpp
+@@ -761,7 +761,8 @@ void reios_reset(u8* rom)
+ 	memset(pFont, 0, 536496);
+ 	size_t size;
+ 	std::unique_ptr<u8[]> fontData = resource::load("fonts/biosfont.bin", size);
+-	memcpy(pFont, fontData.get(), size);
++	if (fontData != nullptr)
++		memcpy(pFont, fontData.get(), size);
+ 
+ 	gdrom_hle_reset();
+ }
+diff --git a/resources/resources.cmake b/resources/resources.cmake
+index 9bf4830a7..3dc1e969b 100644
+--- a/resources/resources.cmake
++++ b/resources/resources.cmake
+@@ -1,5 +1,11 @@
+ cmrc_add_resource_library(flycast-resources ALIAS flycast::res NAMESPACE flycast)
+ 
++# OFF leaves out third-party game data: per-game flash/NVRAM defaults, the
++# F355 print template, printer fonts and the BIOS font. resource::load()
++# returns nullptr for a missing entry.
++option(USE_BUNDLED_GAME_DATA "Embed bundled third-party game data resources" ON)
++
++if(USE_BUNDLED_GAME_DATA)
+ cmrc_add_resources(flycast-resources
+         WHENCE resources
+         resources/flash/alienfnt.nvmem.zip	# network settings
+@@ -30,6 +36,7 @@ cmrc_add_resources(flycast-resources
+         fonts/printer_ascii12x24.bin.zip
+         fonts/printer_kanji16x16.bin.zip
+         fonts/printer_kanji24x24.bin.zip)
++endif()
+ 
+ if(NOT LIBRETRO)
+     cmrc_add_resources(flycast-resources
+@@ -44,7 +51,9 @@ if(NOT LIBRETRO)
+     endif()
+ endif()
+ 
+-cmrc_add_resources(flycast-resources fonts/biosfont.bin.zip)
++if(USE_BUNDLED_GAME_DATA)
++    cmrc_add_resources(flycast-resources fonts/biosfont.bin.zip)
++endif()
+ 
+ cmrc_add_resources(flycast-resources
+ 	WHENCE resources
+-- 
+2.56.0.windows.3
+

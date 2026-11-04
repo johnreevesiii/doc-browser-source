@@ -1,0 +1,53 @@
+doc-browser-source
+Copyright (C) 2026 John R Reeves III
+
+This program is free software; you can redistribute it and/or modify it
+under the terms of the GNU General Public License as published by the Free
+Software Foundation; either version 2 of the License, or (at your option)
+any later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+more details. The full text of version 2 is in the file LICENSE.
+
+SPDX-License-Identifier: GPL-2.0-or-later
+
+Scope
+-----
+John R Reeves III holds the copyright in the code and documents written for
+this project: host/, stubs/, scripts/, and our own changes in the patch
+series under flycast/patches/ (patches 0004 to 0022, and the conflict
+resolutions and removals in 0001 and 0003) and flycast/patches-linkbus2/
+(patches 0001 to 0009).
+
+Third-party code
+----------------
+The patch series under flycast/ modify and carry code from:
+
+- Flycast, https://github.com/flyinghead/flycast
+  Copyright flyinghead and the Flycast contributors.
+  GPL-2.0-or-later. Upstream base commit 8412d3d8a.
+
+- flycast-wasm, https://github.com/nasomers/flycast-wasm
+  Copyright nasomers and contributors. GPL-2.0.
+  Port commit 16e9c7b. The core/rec-wasm files added in patch 0002 come
+  from this project unchanged and carry its licence.
+
+Those copyrights stay with their holders. See THIRD_PARTY_NOTICES.md for the
+third-party libraries linked into the cores and their licences.
+
+Licence of the served cores
+---------------------------
+The served cores currently also contain libcdio's core/imgread/iso9660.h
+(carried in upstream Flycast), which is GPL-3.0-or-later. The combined cores
+are therefore distributed under the GNU General Public License, version 3 or
+(at your option) any later version, until a planned patch (0023, SOURCE.md
+section 8) takes that header out of the build. The full text of version 3 is
+in the file LICENSE.GPL-3. Our own code and patches stay GPL-2.0-or-later,
+which permits this.
+
+No ROM
+------
+This repository contains no game ROM bytes and nothing derived from a ROM.
+Players supply their own ROM, which never leaves their browser.

@@ -1,0 +1,106 @@
+From aed93719a4e82d51ca3d90c286adff9bfe6d8ae0 Mon Sep 17 00:00:00 2001
+From: John R Reeves III <johnreevesiii@outlook.com>
+Date: Mon, 2 Nov 2026 09:12:53 -0800
+Subject: [PATCH 20/22] rec-wasm: run every single-instruction interpreter step
+ under the ifb guard
+
+Besides shop_ifb, rec_wasm.cpp steps single SH4 instructions through
+OpPtr in ref mode, in clean dispatch, and after a failed compile or a
+trap. Those handlers also store through WriteMem*, so their RAM writes
+did not bump g_fly_page_gen either. Each of those calls now runs under
+FlyIfbWriteGuard.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MGX7KQ5gfrWApgW64pZbQ5
+---
+ core/rec-wasm/rec_wasm.cpp | 18 +++++++++---------
+ 1 file changed, 9 insertions(+), 9 deletions(-)
+
+diff --git a/core/rec-wasm/rec_wasm.cpp b/core/rec-wasm/rec_wasm.cpp
+index d14c5a3b1..1fe0e56bc 100644
+--- a/core/rec-wasm/rec_wasm.cpp
++++ b/core/rec-wasm/rec_wasm.cpp
+@@ -1563,7 +1563,7 @@ static void ref_execute_block(RuntimeBlockInfo* block) {
+ 			return;
+ 		}
+ 		actual_iters++;
+-		OpPtr[op](&ctx, op);
++		{ FlyIfbWriteGuard wg; OpPtr[op](&ctx, op); }   // stores bump g_fly_page_gen
+ 		// Per-instruction cycle charging — only active in mode 0 (pure ref).
+ 		// EXECUTOR_MODE is defined above this function.
+ #if EXECUTOR_MODE == 0
+@@ -3925,7 +3925,7 @@ static void inline_handle_miss(u32 miss_pc, u32 ctx_ptr, u32 ram_ptr) {
+ 		} else {
+ 			sh4ctx->pc = miss_pc + 2;
+ 			u16 rawOp = IReadMem16(miss_pc);
+-			OpPtr[rawOp](sh4ctx, rawOp);
++			{ FlyIfbWriteGuard wg; OpPtr[rawOp](sh4ctx, rawOp); }   // stores bump g_fly_page_gen
+ 			sh4ctx->cycle_counter -= 1;
+ 		}
+ 		if (g_ifb_exception_pending) {
+@@ -3961,7 +3961,7 @@ static void inline_handle_miss(u32 miss_pc, u32 ctx_ptr, u32 ram_ptr) {
+ 			u16 rawOp = IReadMem16(miss_pc);
+ 			if (sh4ctx->sr.FD == 1 && OpDesc[rawOp]->IsFloatingPoint())
+ 				throw SH4ThrownException(miss_pc, Sh4Ex_FpuDisabled);
+-			OpPtr[rawOp](sh4ctx, rawOp);
++			{ FlyIfbWriteGuard wg; OpPtr[rawOp](sh4ctx, rawOp); }   // stores bump g_fly_page_gen
+ 			sh4ctx->cycle_counter -= 1;
+ 		}
+ 	}
+@@ -4223,7 +4223,7 @@ static int clean_dispatch_loop(u32 ctx_ptr, u32 ram_base) {
+ 			u16 rawOp = IReadMem16(pc);
+ 			if (ctx.sr.FD == 1 && OpDesc[rawOp]->IsFloatingPoint())
+ 				throw SH4ThrownException(pc, Sh4Ex_FpuDisabled);
+-			OpPtr[rawOp](&ctx, rawOp);
++			{ FlyIfbWriteGuard wg; OpPtr[rawOp](&ctx, rawOp); }   // stores bump g_fly_page_gen
+ 			ctx.cycle_counter -= 1;
+ 		} else {
+ 			g_ifb_exception_pending = false;
+@@ -4232,7 +4232,7 @@ static int clean_dispatch_loop(u32 ctx_ptr, u32 ram_base) {
+ 			} else {
+ 				ctx.pc = pc + 2;
+ 				u16 rawOp = IReadMem16(pc);
+-				OpPtr[rawOp](&ctx, rawOp);
++				{ FlyIfbWriteGuard wg; OpPtr[rawOp](&ctx, rawOp); }   // stores bump g_fly_page_gen
+ 				ctx.cycle_counter -= 1;
+ 			}
+ 			if (g_ifb_exception_pending) {
+@@ -6551,7 +6551,7 @@ public:
+ 							u16 rawOp = IReadMem16(pc);
+ 							if (sh4ctx->sr.FD == 1 && OpDesc[rawOp]->IsFloatingPoint())
+ 								throw SH4ThrownException(pc, Sh4Ex_FpuDisabled);
+-							OpPtr[rawOp](sh4ctx, rawOp);
++							{ FlyIfbWriteGuard wg; OpPtr[rawOp](sh4ctx, rawOp); }   // stores bump g_fly_page_gen
+ 							sh4ctx->cycle_counter -= 1;
+ 							interpExecs++;
+ #if LOCKSTEP_DIFF_BUILD
+@@ -7067,7 +7067,7 @@ public:
+ 									u16 rawOp = IReadMem16(miss_pc);
+ 									if (sh4ctx->sr.FD == 1 && OpDesc[rawOp]->IsFloatingPoint())
+ 										throw SH4ThrownException(miss_pc, Sh4Ex_FpuDisabled);
+-									OpPtr[rawOp](sh4ctx, rawOp);
++									{ FlyIfbWriteGuard wg; OpPtr[rawOp](sh4ctx, rawOp); }   // stores bump g_fly_page_gen
+ 									sh4ctx->cycle_counter -= 1;
+ 								}
+ 								if (g_ifb_exception_pending) {
+@@ -7152,7 +7152,7 @@ public:
+ 									u16 rawOp = IReadMem16(miss_pc);
+ 									if (sh4ctx->sr.FD == 1 && OpDesc[rawOp]->IsFloatingPoint())
+ 										throw SH4ThrownException(miss_pc, Sh4Ex_FpuDisabled);
+-									OpPtr[rawOp](sh4ctx, rawOp);
++									{ FlyIfbWriteGuard wg; OpPtr[rawOp](sh4ctx, rawOp); }   // stores bump g_fly_page_gen
+ 									sh4ctx->cycle_counter -= 1;
+ 									interpExecs++;
+ #if LOCKSTEP_DIFF_BUILD
+@@ -7233,7 +7233,7 @@ public:
+ 					try {
+ 						if (sh4ctx->sr.FD == 1 && OpDesc[rawOp]->IsFloatingPoint())
+ 							throw SH4ThrownException(trap_pc, Sh4Ex_FpuDisabled);
+-						OpPtr[rawOp](sh4ctx, rawOp);
++						{ FlyIfbWriteGuard wg; OpPtr[rawOp](sh4ctx, rawOp); }   // stores bump g_fly_page_gen
+ 					} catch (const SH4ThrownException& inner_ex) {
+ 						Do_Exception(inner_ex.epc, inner_ex.expEvn);
+ 						sh4ctx->cycle_counter += 5;
+-- 
+2.56.0.windows.3
+

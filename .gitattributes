@@ -1,0 +1,7 @@
+# Patch files carry upstream CRLF lines; keep their bytes exactly as written.
+*.patch -text
+*.diff -text
+# The build and link scripts are the exact files the served cores were built with; keep their bytes exact.
+scripts/build-win.ps1 -text
+scripts/link-win.ps1 -text
+scripts/link-linkbus2.ps1 -text

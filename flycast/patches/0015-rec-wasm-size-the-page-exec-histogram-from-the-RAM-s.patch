@@ -1,0 +1,76 @@
+From 7b75396a08e8d117a51ccfef5babdec9689620e8 Mon Sep 17 00:00:00 2001
+From: John R Reeves III <johnreevesiii@outlook.com>
+Date: Mon, 2 Nov 2026 08:30:38 -0800
+Subject: [PATCH 15/22] rec-wasm: size the page-exec histogram from the RAM
+ size
+
+g_fly_page_execs, the region discovery scan and the pe_prev/wdelta
+window in fly_region_pipeline_tick were fixed at 4096 pages, the 16 MB
+Dreamcast RAM. NAOMI has 32 MB (8192 pages), so the dispatch-path
+histogram bump would index past the array. The arrays are now sized
+FLY_PAGE_GEN_COUNT (RAM_SIZE_MAX pages, like g_fly_page_gen) and the
+scans run over RAM_SIZE >> 12 pages. wdelta moves off the stack.
+
+No behaviour change in current builds: all of this is behind
+FLY_REGIONS_LIVE, which is 0.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MGX7KQ5gfrWApgW64pZbQ5
+---
+ core/rec-wasm/rec_wasm.cpp | 19 ++++++++++++-------
+ 1 file changed, 12 insertions(+), 7 deletions(-)
+
+diff --git a/core/rec-wasm/rec_wasm.cpp b/core/rec-wasm/rec_wasm.cpp
+index 7a6e75652..16f5d46b7 100644
+--- a/core/rec-wasm/rec_wasm.cpp
++++ b/core/rec-wasm/rec_wasm.cpp
+@@ -685,7 +685,10 @@ static inline void addMemWritePenalty(u32 addr, u32 size) {
+ // 2026-07-21): the page-exec histogram and the discovery function feed
+ // fly_region_pipeline_tick(), which prod builds run when regions are
+ // enabled. Everything else in the dev block below stays dev-only.
+-u32 g_fly_page_execs[4096];   // dispatch count per 4KB RAM page (region scoping)
++u32 g_fly_page_execs[FLY_PAGE_GEN_COUNT];   // dispatch count per 4KB RAM page (region scoping)
++// Pages in the current platform RAM (4096 for 16 MB Dreamcast, 8192 for
++// 32 MB NAOMI); the arrays above are sized for RAM_SIZE_MAX.
++static inline u32 fly_ram_pages() { return RAM_SIZE >> 12; }
+ // Region discovery (design v0): seed at the hottest page, extend to contiguous
+ // neighbors holding >=5% of the seed's window count, cap 8 pages. Returns
+ // [first,last] page or first=0xFFFFFFFF if nothing hot enough.
+@@ -702,7 +705,8 @@ static FlyRegionCandidate fly_discover_region(const u32* window_execs)
+ {
+ 	FlyRegionCandidate rc;
+ 	u32 seed = 0; u32 seedv = 0;
+-	for (u32 pi = 0; pi < 4096; pi++) {
++	const u32 npages = fly_ram_pages();
++	for (u32 pi = 0; pi < npages; pi++) {
+ 		rc.total += window_execs[pi];
+ 		if (window_execs[pi] > seedv) { seedv = window_execs[pi]; seed = pi; }
+ 	}
+@@ -718,8 +722,8 @@ static FlyRegionCandidate fly_discover_region(const u32* window_execs)
+ 		u32 nl = lo, nh = hi;
+ 		while (nl > 0 && window_execs[nl - 1] < thresh && lo - (nl - 1) + 0 < 8 && hi - (nl - 1) + 1 <= 8) nl--;
+ 		bool canL = (nl > 0) && (hi - (nl - 1) + 1 <= 8) && window_execs[nl - 1] >= thresh;
+-		while (nh < 4095 && window_execs[nh + 1] < thresh && (nh + 1) - lo + 1 <= 8) nh++;
+-		bool canR = (nh < 4095) && ((nh + 1) - lo + 1 <= 8) && window_execs[nh + 1] >= thresh;
++		while (nh + 1 < npages && window_execs[nh + 1] < thresh && (nh + 1) - lo + 1 <= 8) nh++;
++		bool canR = (nh + 1 < npages) && ((nh + 1) - lo + 1 <= 8) && window_execs[nh + 1] >= thresh;
+ 		if (canL && (!canR || window_execs[nl - 1] >= window_execs[nh + 1]))
+ 			lo = nl - 1;
+ 		else if (canR)
+@@ -5443,9 +5447,10 @@ static void fly_region_pipeline_tick()
+ {
+ 				{
+ 					// Region discovery dry-run: what would we compile right now?
+-					static u32 pe_prev[4096];
+-					u32 wdelta[4096];
+-					for (int pi = 0; pi < 4096; pi++) {
++					static u32 pe_prev[FLY_PAGE_GEN_COUNT];
++					static u32 wdelta[FLY_PAGE_GEN_COUNT];
++					const u32 npages = fly_ram_pages();
++					for (u32 pi = 0; pi < npages; pi++) {
+ 						wdelta[pi] = g_fly_page_execs[pi] - pe_prev[pi];
+ 						pe_prev[pi] = g_fly_page_execs[pi];
+ 					}
+-- 
+2.56.0.windows.3
+

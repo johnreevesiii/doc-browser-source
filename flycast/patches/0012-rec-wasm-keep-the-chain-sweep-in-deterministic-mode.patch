@@ -1,0 +1,100 @@
+From d8dc34134a7048e511af11a369515871b4376397 Mon Sep 17 00:00:00 2001
+From: John R Reeves III <johnreevesiii@outlook.com>
+Date: Mon, 2 Nov 2026 08:11:14 -0800
+Subject: [PATCH 12/22] rec-wasm: keep the chain sweep in deterministic mode
+
+Deterministic mode turned the chain sweep off because chain compiles
+were async and the sweep was capped by wall time. Without chains the
+steady frame cost was about 1.8 ms higher than the default mode
+(drbyocwc attract and breeding farm, Chromium, real GPU).
+
+In mode 1 the sweep now runs with count budgets only (512 scanned, at
+most FLY_DET_CHAIN_BUILDS = 16 built per frame, no time cap), compiles
+each chain synchronously and promotes it through drainChainQueue() in
+the same frame, at mainloop entry. Mode 2 keeps the sweep off.
+
+Steady cost is now the same as the default mode (7.1 ms per frame in
+retro_run), and lockstep hashes still match over 9000 frames between
+two Chromium runs and between Chromium and Firefox.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MGX7KQ5gfrWApgW64pZbQ5
+---
+ core/rec-wasm/rec_wasm.cpp | 29 ++++++++++++++++++++++++-----
+ 1 file changed, 24 insertions(+), 5 deletions(-)
+
+diff --git a/core/rec-wasm/rec_wasm.cpp b/core/rec-wasm/rec_wasm.cpp
+index 70d5fe058..7a1cc1e55 100644
+--- a/core/rec-wasm/rec_wasm.cpp
++++ b/core/rec-wasm/rec_wasm.cpp
+@@ -605,6 +605,8 @@ static inline void primeDispatchEntry(u32 vaddr, u32 sh4_code_size, u32 table_id
+ static int g_fly_det = 0;
+ extern "C" void fly_set_deterministic(int on) { g_fly_det = (on < 0 || on > 2) ? 1 : on; }
+ #define g_defer_runtime (FLY_DEFER_ON && g_fly_det != 2)
++// Chains built (synchronously) per frame by the deterministic chain sweep.
++#define FLY_DET_CHAIN_BUILDS 16
+ #define FLY_FRAME_BUDGET_MS 24.0
+ static double g_frame_start_ms = 0;   // stamped at mainloop entry
+ static inline bool fly_frame_over_budget() {
+@@ -6030,7 +6032,12 @@ public:
+ 		// working set is un-chained (DOA2 measured ~7000 chains needed per
+ 		// fight-mode switch — 20-30s at the old throttle), trickle when caught
+ 		// up. A wall-time cap bounds main-thread byte-building either way.
+-		if (!g_fly_det)
++		// Deterministic mode 1 runs the sweep with count budgets only (no
++		// wall-time cap, no burst growth past FLY_DET_CHAIN_BUILDS) and
++		// compiles each chain synchronously; drainChainQueue() below promotes
++		// them in this same frame, so chain formation depends only on guest
++		// execution. Mode 2 keeps the sweep off.
++		if (g_fly_det != 2)
+ 		{
+ 			static std::vector<u32> cs_sweep;
+ 			static size_t cs_pos = 0;
+@@ -6043,13 +6050,14 @@ public:
+ 					cs_sweep.push_back(kv.first);
+ 				cs_pos = 0;
+ 			}
+-			int cs_scan_budget  = cs_burst ? 512 : 64;
+-			int cs_build_budget = cs_burst ? 64  : 8;
++			const bool cs_det = g_fly_det == 1;
++			int cs_scan_budget  = cs_det ? 512 : (cs_burst ? 512 : 64);
++			int cs_build_budget = cs_det ? FLY_DET_CHAIN_BUILDS : (cs_burst ? 64 : 8);
+ 			const double cs_ms_cap = cs_burst ? 2.0 : 0.5;
+ 			double cs_t0 = emscripten_get_now();
+ 			int cs_built_this = 0;
+ 			while (cs_scan_budget-- > 0 && cs_build_budget > 0 && cs_pos < cs_sweep.size()) {
+-				if (emscripten_get_now() - cs_t0 > cs_ms_cap)
++				if (!cs_det && emscripten_get_now() - cs_t0 > cs_ms_cap)
+ 					break;
+ 				u32 v = cs_sweep[cs_pos++];
+ 				if (g_chain_by_head.count(v) || g_chain_pending.count(v)) continue;
+@@ -6102,7 +6110,16 @@ public:
+ 				WasmModuleBuilder cb;
+ 				if (!buildMultiBlockModule(cb, schain, gcells)) { free(gcells); continue; }
+ 				const auto& cbytes = cb.getBytes();
+-				wasm_compile_chain_async(cbytes.data(), (u32)cbytes.size(), v);
++				if (cs_det) {
++					int cidx = wasm_compile_chain(cbytes.data(), (u32)cbytes.size(), v);
++					if (cidx <= 0) { free(gcells); continue; }
++					EM_ASM({
++						if (!Module._flyChainReady) Module._flyChainReady = [];
++						Module._flyChainReady.push({ pc: $0, idx: $1 });
++					}, v, cidx);
++				} else {
++					wasm_compile_chain_async(cbytes.data(), (u32)cbytes.size(), v);
++				}
+ 				PendingChain pend;
+ 				pend.guard_cells = gcells;
+ 				pend.head_size = bi->second->sh4_code_size;
+@@ -6118,6 +6135,8 @@ public:
+ 			// is flowing than the trickle absorbs; zero built = caught up.
+ 			if (cs_built_this >= (cs_burst ? 48 : 8)) cs_burst = true;
+ 			else if (cs_built_this == 0) cs_burst = false;
++			if (cs_det && cs_built_this > 0)
++				drainChainQueue();
+ 		}
+ #elif FLY_CHAIN_SHADOW
+ 		// SHADOW FARM PATH — the original sync pipeline, kept intact so
+-- 
+2.56.0.windows.3
+

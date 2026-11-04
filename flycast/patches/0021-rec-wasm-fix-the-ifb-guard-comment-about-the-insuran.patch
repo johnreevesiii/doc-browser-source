@@ -1,0 +1,36 @@
+From 992aa14527909cc3c5690607a5e2017ccc19529a Mon Sep 17 00:00:00 2001
+From: John R Reeves III <johnreevesiii@outlook.com>
+Date: Mon, 2 Nov 2026 09:12:53 -0800
+Subject: [PATCH 21/22] rec-wasm: fix the ifb guard comment about the insurance
+ tick
+
+The comment said a missed page-generation bump was caught by the 1/64
+insurance tick. FLY_SMC_INSURANCE_TICK is 0 in this build, so nothing
+bounded it. The comment now says so and lists the interpreter steps
+the guard covers.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MGX7KQ5gfrWApgW64pZbQ5
+---
+ core/rec-wasm/rec_wasm.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/core/rec-wasm/rec_wasm.cpp b/core/rec-wasm/rec_wasm.cpp
+index 1fe0e56bc..1dc473dc4 100644
+--- a/core/rec-wasm/rec_wasm.cpp
++++ b/core/rec-wasm/rec_wasm.cpp
+@@ -865,7 +865,10 @@ u32 EMSCRIPTEN_KEEPALIVE wasm_get_vram_base() {
+ // imports. and.b, or.b and xor.b #imm,@(R0,GBR) always decode to ifb, so
+ // without this guard their RAM stores left g_fly_page_gen unchanged and a
+ // gen-gated dispatch slot could skip the SMC re-hash for the written page
+-// until the 1/64 insurance tick. The guard swaps in WriteMem* wrappers that
++// (no insurance tick bounds that in this build: FLY_SMC_INSURANCE_TICK is
++// off, so a missed bump went unnoticed until something else wrote the
++// page). Every single-instruction interpreter step in this file (ref mode,
++// clean dispatch, compile-failed and trap steps) runs under it too. The guard swaps in WriteMem* wrappers that
+ // bump the page generation for the duration of one ifb op and restores the
+ // previous pointers afterwards (also on an SH4 exception), unless the op
+ // itself installed new handlers (an MMU switch), which are kept.
+-- 
+2.56.0.windows.3
+

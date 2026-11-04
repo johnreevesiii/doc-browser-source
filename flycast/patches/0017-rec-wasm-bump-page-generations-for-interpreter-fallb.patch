@@ -1,0 +1,111 @@
+From 915d136c80683bc938a531d1cb1111cd0f0707ec Mon Sep 17 00:00:00 2001
+From: John R Reeves III <johnreevesiii@outlook.com>
+Date: Mon, 2 Nov 2026 08:35:50 -0800
+Subject: [PATCH 17/22] rec-wasm: bump page generations for
+ interpreter-fallback stores
+
+Interpreter fallback ops (shop_ifb) run the SH4 interpreter handler,
+which stores through the WriteMem* pointers rather than the
+wasm_mem_write* imports, so their RAM stores never bumped
+g_fly_page_gen. and.b, or.b and xor.b #imm,@(R0,GBR) always decode to
+ifb. A gen-gated dispatch slot covering the written page could then
+skip the SMC re-hash until the 1/64 insurance tick. The whole-block
+SHIL bridge had the same gap for plain shop_writem.
+
+wasm_exec_ifb and the bridge's shop_ifb case now run the handler under
+FlyIfbWriteGuard, which swaps in WriteMem8/16/32/64 wrappers that bump
+the written pages and restores the previous pointers afterwards (also
+when the op throws an SH4 exception), unless the op installed new
+handlers itself. The bridge's shop_writem bumps the page like the
+imports do.
+
+Tested by the fly_jit_selftest hook (next commit): an or.b store
+through wasm_exec_ifb now bumps the page cell; the bare handler, the
+old path, does not.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MGX7KQ5gfrWApgW64pZbQ5
+---
+ core/rec-wasm/rec_wasm.cpp | 50 +++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 49 insertions(+), 1 deletion(-)
+
+diff --git a/core/rec-wasm/rec_wasm.cpp b/core/rec-wasm/rec_wasm.cpp
+index 40f424c1e..5579b6896 100644
+--- a/core/rec-wasm/rec_wasm.cpp
++++ b/core/rec-wasm/rec_wasm.cpp
+@@ -835,8 +835,50 @@ u32 EMSCRIPTEN_KEEPALIVE wasm_get_vram_base() {
+ 	return (u32)(uintptr_t)&vram[0];
+ }
+ 
++}  // extern "C"
++
++// Interpreter fallback ops (shop_ifb) run the SH4 interpreter handler, which
++// stores through the WriteMem* pointers, not through the wasm_mem_write*
++// imports. and.b, or.b and xor.b #imm,@(R0,GBR) always decode to ifb, so
++// without this guard their RAM stores left g_fly_page_gen unchanged and a
++// gen-gated dispatch slot could skip the SMC re-hash for the written page
++// until the 1/64 insurance tick. The guard swaps in WriteMem* wrappers that
++// bump the page generation for the duration of one ifb op and restores the
++// previous pointers afterwards (also on an SH4 exception), unless the op
++// itself installed new handlers (an MMU switch), which are kept.
++static WriteMem8Func  g_ifb_wm8;
++static WriteMem16Func g_ifb_wm16;
++static WriteMem32Func g_ifb_wm32;
++static WriteMem64Func g_ifb_wm64;
++static void DYNACALL fly_ifb_wm8 (u32 a, u8  d) { fly_ram_written(a, 1); g_ifb_wm8(a, d); }
++static void DYNACALL fly_ifb_wm16(u32 a, u16 d) { fly_ram_written(a, 2); g_ifb_wm16(a, d); }
++static void DYNACALL fly_ifb_wm32(u32 a, u32 d) { fly_ram_written(a, 4); g_ifb_wm32(a, d); }
++static void DYNACALL fly_ifb_wm64(u32 a, u64 d) { fly_ram_written(a, 8); g_ifb_wm64(a, d); }
++struct FlyIfbWriteGuard {
++	bool active;
++	FlyIfbWriteGuard() : active(WriteMem32 != fly_ifb_wm32) {
++		if (!active)
++			return;   // nested: the outer guard is installed
++		g_ifb_wm8 = WriteMem8;   g_ifb_wm16 = WriteMem16;
++		g_ifb_wm32 = WriteMem32; g_ifb_wm64 = WriteMem64;
++		WriteMem8 = fly_ifb_wm8;   WriteMem16 = fly_ifb_wm16;
++		WriteMem32 = fly_ifb_wm32; WriteMem64 = fly_ifb_wm64;
++	}
++	~FlyIfbWriteGuard() {
++		if (!active)
++			return;
++		if (WriteMem8 == fly_ifb_wm8)   WriteMem8 = g_ifb_wm8;
++		if (WriteMem16 == fly_ifb_wm16) WriteMem16 = g_ifb_wm16;
++		if (WriteMem32 == fly_ifb_wm32) WriteMem32 = g_ifb_wm32;
++		if (WriteMem64 == fly_ifb_wm64) WriteMem64 = g_ifb_wm64;
++	}
++};
++
++extern "C" {
++
+ void EMSCRIPTEN_KEEPALIVE wasm_exec_ifb(u32 opcode, u32 pc) {
+ 	(void)pc;
++	FlyIfbWriteGuard wg;
+ 	OpPtr[opcode](&Sh4cntx, opcode);
+ }
+ 
+@@ -1269,6 +1311,9 @@ void EMSCRIPTEN_KEEPALIVE wasm_exec_shil_fb(u32 block_vaddr, u32 op_index) {
+ 				g_shil_writes.push_back(e);
+ 			}
+ 			// (validator logs writes at the WriteMem* wrapper, uniformly)
++			// Bridged stores bump the page generation like the
++			// wasm_mem_write* imports and the inline stores do.
++			fly_ram_written(addr, op.size);
+ 			if (op.size == 8) {
+ 				u32 soff = op.rs2.reg_offset();
+ 				WriteMem32(addr, *(u32*)((u8*)&ctx + soff));
+@@ -1293,7 +1338,10 @@ void EMSCRIPTEN_KEEPALIVE wasm_exec_shil_fb(u32 block_vaddr, u32 op_index) {
+ 		// SHIL ops continued executing after the exception.
+ 		if (ctx.sr.FD == 1 && OpDesc[op.rs3._imm]->IsFloatingPoint())
+ 			throw SH4ThrownException(ctx.pc - 2, Sh4Ex_FpuDisabled);
+-		OpPtr[op.rs3._imm](&ctx, op.rs3._imm);
++		{
++			FlyIfbWriteGuard wg;   // RAM stores bump g_fly_page_gen
++			OpPtr[op.rs3._imm](&ctx, op.rs3._imm);
++		}
+ 		break;
+ 	}
+ 	case shop_illegal: {
+-- 
+2.56.0.windows.3
+

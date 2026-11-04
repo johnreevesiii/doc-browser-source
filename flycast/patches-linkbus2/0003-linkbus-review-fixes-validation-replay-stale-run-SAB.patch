@@ -1,0 +1,1230 @@
+From e74f386c6320608746062cbbdd05175dbf16b275 Mon Sep 17 00:00:00 2001
+From: John R Reeves III <johnreevesiii@outlook.com>
+Date: Mon, 2 Nov 2026 07:24:26 -0800
+Subject: [PATCH 3/9] linkbus: review fixes (validation, replay, stale run, SAB
+ barrier)
+
+Fixes from the independent review of d3c70df2e and aed3de564:
+
+- Multiboard teardown: ~Multiboard no longer calls requestExit(); every
+  backend destructor signals exit, so the native shm path stores exit and
+  notifies once, as at 8412d3d8a. InMemoryBoard and SabBoard gain
+  destructors that request exit.
+- peekHubTick (mailbox and in-memory seat) trusts only frames that pass
+  checkAssembledFrame for the seat (target, session, edition, geometry,
+  size); otherwise it returns the last trusted tick.
+- hubTick is documented as strictly monotonic for a sessionTag's life (a
+  restarted hub must issue a new tag). A mailbox seat reports a link error
+  after MailboxConfig::maxStaleRun (default 120) consecutive well-formed
+  frames refused only as stale (Stats::staleTick).
+- checkSlotFrame refuses slotSize * slotCount > kMaxPayload; the mailbox
+  seat does not send such frames. InMemoryHub::submit takes the sender
+  from the transport (fromNode) and refuses a mismatched nodeId and a
+  localFrame that is not newer (replay, Stats::replayed).
+- InMemoryHub clamps delayFrames to kMaxDelayFrames (600) and releases by
+  tick distance, so stamps near wraparound do not release early.
+- Mailbox take() treats seq 0 from the pull as no new frame.
+- SAB barrier waits until the generation changes or time runs out, and a
+  timed-out board withdraws its arrival bit (ok if the barrier completed
+  meanwhile).
+- InMemoryBoard::directData() returns nullptr so dmaStart uses the clamped
+  copyOut().
+- linkbus_install_mailbox and the SAB multiboard factory check that the
+  buffers are SharedArrayBuffers of at least the layout sizes.
+
+Tests: 12 new regression tests in tests/linkbus (several from the
+reviewer's adversarial cases); run-tests.sh accepts LINKBUS_TEST_FLAGS for
+sanitizer runs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MGX7KQ5gfrWApgW64pZbQ5
+---
+ core/hw/naomi/multiboard.cpp   |   4 +-
+ core/network/linkbus.cpp       | 164 +++++++---
+ core/network/linkbus.h         |  61 +++-
+ core/network/linkbus_web.cpp   |  69 ++++-
+ tests/linkbus/linkbus_test.cpp | 525 ++++++++++++++++++++++++++++++++-
+ tests/linkbus/run-tests.sh     |   3 +-
+ 6 files changed, 766 insertions(+), 60 deletions(-)
+
+diff --git a/core/hw/naomi/multiboard.cpp b/core/hw/naomi/multiboard.cpp
+index 4e4d13434..5b53368ac 100644
+--- a/core/hw/naomi/multiboard.cpp
++++ b/core/hw/naomi/multiboard.cpp
+@@ -733,8 +733,8 @@ Multiboard::~Multiboard()
+ 	if (schedId != -1)
+ 		sh4_sched_unregister(schedId);
+ 
+-	if (backend != nullptr)
+-		backend->requestExit();
++	// The backend destructor signals exit (the shm one exactly as 8412d3d8a:
++	// one exit store, one notify, then teardown).
+ 	backend.reset();
+ }
+ 
+diff --git a/core/network/linkbus.cpp b/core/network/linkbus.cpp
+index 778c84aec..4aea7ca89 100644
+--- a/core/network/linkbus.cpp
++++ b/core/network/linkbus.cpp
+@@ -80,6 +80,9 @@ FrameCheck checkSlotFrame(const u8 *bytes, u32 size, const WireExpect& expect,
+ 		return FrameCheck::BadHeader;
+ 	if (h.slotSize == 0 || (expect.slotSize != 0 && h.slotSize != expect.slotSize))
+ 		return FrameCheck::BadSize;
++	// The hub assembles slotSize * slotCount bytes per seat.
++	if ((u32)h.slotSize * h.slotCount > kMaxPayload)
++		return FrameCheck::BadSize;
+ 	if (size != sizeof(h) + h.slotSize)
+ 		return FrameCheck::BadSize;
+ 	if (out != nullptr)
+@@ -247,20 +250,28 @@ struct InMemoryHub::Impl
+ 	bool failed = false;
+ 	std::vector<std::deque<Snapshot>> nodes;
+ 	std::vector<u32> nextId;
++	std::vector<bool> haveLocal;		// per node: a localFrame was accepted
++	std::vector<u32> lastLocal;			// per node: newest accepted localFrame
+ 	std::vector<Seat> seats;
+ 	Stats stats;
+ 	mutable std::mutex mutex;
+ 	std::condition_variable cond;
+ 
+ 	Impl(int n, Edition edition, u32 delay, u32 sessionTag)
+-		: n(n), edition(edition), delay(delay), sessionTag(sessionTag),
+-		  nodes(n), nextId(n, 1), seats(n) {}
++		: n(n), edition(edition), delay(std::min(delay, kMaxDelayFrames)), sessionTag(sessionTag),
++		  nodes(n), nextId(n, 1), haveLocal(n, false), lastLocal(n, 0), seats(n) {}
++
++	// stamp + 1 + delay <= tick, without overflow: stamps are never ahead
++	// of tick, so the unsigned distance is the age even across wraparound.
++	bool released(u32 stamp) const {
++		return tick - stamp >= 1 + delay;
++	}
+ 
+ 	const Snapshot *delayed(int node) const
+ 	{
+ 		const Snapshot *best = nullptr;
+ 		for (const Snapshot& s : nodes[node])
+-			if (s.stamp + 1 + delay <= tick)
++			if (released(s.stamp))
+ 				best = &s;
+ 		return best;
+ 	}
+@@ -270,12 +281,12 @@ struct InMemoryHub::Impl
+ 		for (int i = 0; i < n; i++)
+ 		{
+ 			auto& q = nodes[i];
+-			while (q.size() >= 2 && q[1].stamp + 1 + delay <= tick)
++			while (q.size() >= 2 && released(q[1].stamp))
+ 				q.pop_front();
+ 		}
+ 	}
+ 
+-	FrameCheck submit(const u8 *bytes, u32 size)
++	FrameCheck submit(int fromNode, const u8 *bytes, u32 size)
+ 	{
+ 		WireExpect expect;
+ 		expect.edition = edition;
+@@ -291,6 +302,19 @@ struct InMemoryHub::Impl
+ 			else stats.badHeader++;
+ 			return c;
+ 		}
++		// The sender is who the transport says, not what the frame claims.
++		if (fromNode < 0 || fromNode >= n || h.nodeId != fromNode)
++		{
++			stats.badHeader++;
++			return FrameCheck::BadHeader;
++		}
++		if (haveLocal[h.nodeId] && (int)(h.localFrame - lastLocal[h.nodeId]) <= 0)
++		{
++			stats.replayed++;
++			return FrameCheck::BadHeader;
++		}
++		haveLocal[h.nodeId] = true;
++		lastLocal[h.nodeId] = h.localFrame;
+ 		slotSize = h.slotSize;
+ 		Snapshot s;
+ 		s.stamp = tick;
+@@ -394,7 +418,7 @@ public:
+ 		st.published++;
+ 		// A refused frame (foreign edition, bad size) is dropped and counted by
+ 		// the hub; it is not a link error, as a stray UDP packet is not.
+-		FrameCheck c = hub.submit(frame.data(), (u32)frame.size());
++		FrameCheck c = hub.submit(r.slotId, frame.data(), (u32)frame.size());
+ 		countCheck(c, st);
+ 		return true;
+ 	}
+@@ -450,16 +474,24 @@ public:
+ 	{
+ 		std::lock_guard<std::mutex> _(hub.mutex);
+ 		Seat& seat = hub.seats[r.slotId];
+-		if (!seat.hasPending)
++		if (seat.hasPending && !closed)
+ 		{
+-			if (!haveTick)
+-				return false;
+-			*tick = lastTick;
+-			return true;
++			WireExpect expect;
++			expect.edition = r.edition;
++			expect.sessionTag = hub.sessionTag;
++			expect.slotCount = r.slotCount;
++			expect.slotSize = hub.slotSize;
++			expect.targetNode = r.slotId;
++			AssembledFrameHeader h;
++			if (checkAssembledFrame(seat.pending.data(), (u32)seat.pending.size(), expect, &h) == FrameCheck::Ok)
++			{
++				*tick = h.hubTick;
++				return true;
++			}
+ 		}
+-		AssembledFrameHeader h;
+-		std::memcpy(&h, seat.pending.data(), sizeof(h));
+-		*tick = h.hubTick;
++		if (!haveTick)
++			return false;
++		*tick = lastTick;
+ 		return true;
+ 	}
+ 
+@@ -505,6 +537,8 @@ std::unique_ptr<RingBackend> InMemoryHub::attach(int slotId, Edition seatEdition
+ 		return nullptr;
+ 	seat = Impl::Seat();
+ 	seat.attached = true;
++	// A new seat starts its localFrame count again.
++	impl->haveLocal[slotId] = false;
+ 	return std::make_unique<InMemorySeat>(*impl, slotId, seatEdition);
+ }
+ 
+@@ -525,10 +559,16 @@ void InMemoryHub::fail()
+ 	impl->cond.notify_all();
+ }
+ 
+-FrameCheck InMemoryHub::submit(const u8 *bytes, u32 size)
++FrameCheck InMemoryHub::submit(int fromNode, const u8 *bytes, u32 size)
+ {
+ 	std::lock_guard<std::mutex> _(impl->mutex);
+-	return impl->submit(bytes, size);
++	return impl->submit(fromNode, bytes, size);
++}
++
++void InMemoryHub::startAtTick(u32 tick)
++{
++	std::lock_guard<std::mutex> _(impl->mutex);
++	impl->tick = tick;
+ }
+ 
+ u32 InMemoryHub::hubTick() const
+@@ -605,7 +645,8 @@ public:
+ 
+ 	bool publish(const u8 *txBase, u32 slotSize, u32 slotCount, u16 packetNumber) override
+ 	{
+-		if (closed || slotSize == 0 || slotSize > kMaxPayload)
++		if (closed || slotSize == 0 || slotSize > kMaxPayload || slotCount == 0
++				|| slotSize * slotCount > kMaxPayload)
+ 			return !closed;
+ 		std::vector<u8> frame = encodeSlotFrame(txBase, slotSize, cfg.role.slotId, (int)slotCount,
+ 				cfg.role.edition, packetNumber, localFrame++, cfg.sessionTag);
+@@ -617,13 +658,15 @@ public:
+ 	TakeResult take(u8 *rxBase, u32 slotSize, u32 slotCount, u32 waitMs) override
+ 	{
+ 		TakeResult res;
+-		if (closed || io->linkError()) {
++		if (closed || staleLinkLost || io->linkError()) {
+ 			res.error = true;
+ 			return res;
+ 		}
+ 		u32 seq;
+ 		u32 len = io->pullLatest(buf.data(), (u32)buf.size(), &seq);
+-		if (seq == lastSeq && waitMs > 0)
++		// seq 0 means "nothing usable" (nothing delivered yet, or the JS pull
++		// gave up after being lapped): never a new frame.
++		if ((seq == 0 || seq == lastSeq) && waitMs > 0)
+ 		{
+ 			io->waitSeq(lastSeq, waitMs);
+ 			if (io->linkError()) {
+@@ -632,31 +675,43 @@ public:
+ 			}
+ 			len = io->pullLatest(buf.data(), (u32)buf.size(), &seq);
+ 		}
+-		if (seq == lastSeq) {
++		if (seq == 0 || seq == lastSeq) {
+ 			st.stale++;
+ 			return res;
+ 		}
+ 		// Deliveries between two takes that were never read (latest wins).
+-		const u32 skipped = seq - lastSeq - 1;
+-		st.dropped += skipped;
++		if ((int)(seq - lastSeq) > 0)
++			st.dropped += seq - lastSeq - 1;
+ 		lastSeq = seq;
+ 
+-		WireExpect expect;
+-		expect.edition = cfg.role.edition;
+-		expect.sessionTag = cfg.sessionTag;
+-		expect.slotCount = (int)slotCount;
+-		expect.slotSize = slotSize;
+-		expect.targetNode = cfg.role.slotId;
+ 		AssembledFrameHeader h;
+-		FrameCheck c = checkAssembledFrame(buf.data(), len, expect, &h);
+-		if (c != FrameCheck::Ok || (haveTick && (int)(h.hubTick - lastTick) <= 0))
++		FrameCheck c = checkAssembledFrame(buf.data(), len, expectFor((int)slotCount, slotSize), &h);
++		if (c != FrameCheck::Ok)
+ 		{
+ 			countCheck(c, st);
+ 			st.stale++;
+ 			return res;
+ 		}
++		if (haveTick && (int)(h.hubTick - lastTick) <= 0)
++		{
++			// Well-formed, refused only as not newer. Under the hubTick
++			// invariant this is a replay or a hub restarted with the same
++			// sessionTag; a long run of them must not freeze the seat silently.
++			st.stale++;
++			st.staleTick++;
++			if (cfg.maxStaleRun != 0 && ++staleRun >= cfg.maxStaleRun)
++			{
++				staleLinkLost = true;
++				res.error = true;
++			}
++			return res;
++		}
++		staleRun = 0;
+ 		haveTick = true;
+ 		lastTick = h.hubTick;
++		lastSlotSize = slotSize;
++		havePeek = true;
++		peekTick = h.hubTick;
+ 		std::memcpy(rxBase, buf.data() + sizeof(h), rxRegionSize(slotSize, (int)slotCount));
+ 		st.taken++;
+ 		res.fresh = true;
+@@ -667,20 +722,43 @@ public:
+ 
+ 	bool peekHubTick(u32 *tick) override
+ 	{
+-		u32 seq;
+-		AssembledFrameHeader h;
+-		u32 len = io->pullLatest((u8 *)&h, sizeof(h), &seq);
+-		if (len >= sizeof(h) && h.magic == kAssembledMagic) {
+-			*tick = h.hubTick;
+-			return true;
++		if (!closed)
++		{
++			u32 seq;
++			AssembledFrameHeader h;
++			const u32 len = io->pullLatest((u8 *)&h, sizeof(h), &seq);
++			// Only the header is copied: checkAssembledFrame reads only the
++			// header bytes and checks `len` against the declared geometry. The
++			// slot size is known once a frame has been taken (else unchecked).
++			if (seq != 0 && len >= sizeof(h)
++					&& checkAssembledFrame((const u8 *)&h, len,
++							expectFor(cfg.role.slotCount, lastSlotSize), nullptr) == FrameCheck::Ok)
++			{
++				havePeek = true;
++				peekTick = h.hubTick;
++			}
+ 		}
+-		return false;
++		if (!havePeek)
++			return false;
++		*tick = peekTick;
++		return true;
+ 	}
+ 
+ 	void shutdown() override { closed = true; }
+ 	Stats stats() const override { return st; }
+ 
+ private:
++	WireExpect expectFor(int slotCount, u32 slotSize) const
++	{
++		WireExpect expect;
++		expect.edition = cfg.role.edition;
++		expect.sessionTag = cfg.sessionTag;
++		expect.slotCount = slotCount;
++		expect.slotSize = slotSize;
++		expect.targetNode = cfg.role.slotId;
++		return expect;
++	}
++
+ 	MailboxConfig cfg;
+ 	std::unique_ptr<MailboxIo> io;
+ 	std::vector<u8> buf;
+@@ -689,6 +767,11 @@ private:
+ 	u32 localFrame = 0;
+ 	bool haveTick = false;
+ 	u32 lastTick = 0;
++	u32 lastSlotSize = 0;		// slot size of the last frame taken (0 = unknown)
++	bool havePeek = false;
++	u32 peekTick = 0;			// newest tick from a frame that passed the checks
++	u32 staleRun = 0;			// consecutive well-formed but not newer frames
++	bool staleLinkLost = false;
+ 	bool closed = false;
+ };
+ 
+@@ -752,6 +835,11 @@ public:
+ 	InMemoryBoard(std::shared_ptr<InMemoryCabinet::Impl> cab, int id, std::function<void(int)> *starter)
+ 		: cab(std::move(cab)), id(id), starter(starter) {}
+ 
++	// Teardown signals exit once, from the backend (see linkbus.h).
++	~InMemoryBoard() override {
++		requestExit();
++	}
++
+ 	int boardId() const override { return id; }
+ 
+ 	u16 status() const override { std::lock_guard<std::mutex> _(cab->mutex); return cab->status; }
+@@ -782,7 +870,7 @@ public:
+ 		bytes = std::min<u32>(bytes, (kMbDataWords - i) * 2);
+ 		std::memcpy(dst, &cab->data[i], bytes);
+ 	}
+-	const u16 *directData() const override { return cab->data.data(); }
++	// directData() stays nullptr: dmaStart() must go through the clamped copyOut().
+ 
+ 	BarrierResult barrier(u32 timeoutMs) override
+ 	{
+diff --git a/core/network/linkbus.h b/core/network/linkbus.h
+index adeb44c64..60c724542 100644
+--- a/core/network/linkbus.h
++++ b/core/network/linkbus.h
+@@ -70,6 +70,15 @@ constexpr u32 kCommTxOffset = 0x100;
+ constexpr u32 kMaxPayload = 0x4000;		// NaomiNetwork Packet payload size
+ constexpr int kMaxRingNodes = 16;
+ 
++// Star backends: a run of this many consecutive frames that are well-formed
++// (session, edition, target and size all match) but refused only because
++// their hubTick is not newer than the last one taken is reported as a link
++// error instead of freezing the seat silently (see hubTick below).
++constexpr u32 kDefaultMaxStaleRun = 120;
++
++// Upper bound for the in-memory hub's equal delay L, in hub ticks (10 s).
++constexpr u32 kMaxDelayFrames = 600;
++
+ // RX source for slot k (1 <= k <= n) at node `own` of an n-node ring.
+ constexpr int rxSourceNode(int own, int n, int k)
+ {
+@@ -127,6 +136,9 @@ public:
+ 
+ 	// Star backends: newest hub tick available, without consuming it (for
+ 	// FramePacer). Returns false when unknown (UDP, nothing received yet).
++	// Only a frame that passes checkAssembledFrame() for this seat (target,
++	// session, edition, geometry and size) is trusted; otherwise the last
++	// trusted tick is returned.
+ 	virtual bool peekHubTick(u32 *tick) { (void)tick; return false; }
+ 
+ 	struct Stats
+@@ -138,6 +150,7 @@ public:
+ 		u32 badEdition = 0;
+ 		u32 badSize = 0;
+ 		u32 badHeader = 0;		// magic, version, target, session
++		u32 staleTick = 0;		// well-formed, refused only as not newer (also in stale)
+ 	};
+ 	virtual Stats stats() const = 0;
+ };
+@@ -183,12 +196,24 @@ struct AssembledFrameHeader
+ 	u8 slotCount;
+ 	u16 slotSize;
+ 	u16 prevPacketNumber;	// packetNumber of node (target + n - 1) mod n
+-	u32 hubTick;			// strictly increasing; freshness test
++	u32 hubTick;			// strictly increasing; freshness test (see below)
+ 	u32 releaseFrame;		// equal-delay release point (PLAN_V2 3.2)
+ 	u32 sessionTag;
+ };
+ #pragma pack(pop)
+ 
++// hubTick invariant: for the whole life of a sessionTag, the hub stamps the
++// frames it sends to a seat with strictly increasing hubTick values (compared
++// by signed 32-bit distance, so wraparound is allowed). A seat takes a frame
++// only if its tick is newer than the last one taken. A hub that restarts, or
++// otherwise cannot continue the tick sequence, must issue a new sessionTag;
++// reusing the tag with a lower tick would freeze every seat. As a safety net,
++// a seat that sees kDefaultMaxStaleRun (MailboxConfig::maxStaleRun) such
++// frames in a row reports a link error.
++//
++// SlotFrameHeader.localFrame is strictly increasing per sender for the life
++// of a seat; the hub refuses a frame whose localFrame is not newer (replay).
++
+ static_assert(sizeof(SlotFrameHeader) == 20, "SlotFrameHeader layout");
+ static_assert(sizeof(AssembledFrameHeader) == 24, "AssembledFrameHeader layout");
+ 
+@@ -211,7 +236,8 @@ enum class FrameCheck
+ 	Ok,
+ 	BadHeader,		// magic, version, session, node or target out of range
+ 	BadEdition,
+-	BadSize,		// slot size, slot count or byte count mismatch
++	BadSize,		// slot size, slot count or byte count mismatch, or
++					// slotSize * slotCount > kMaxPayload
+ };
+ 
+ struct WireExpect
+@@ -279,8 +305,9 @@ private:
+ 
+ // ---- In-memory star (native tests, single-page play) -----------------------
+ // All seats in one process. The driver calls tick() once per hub frame;
+-// delayFrames is the equal delay L. A seat's publish() goes through the same
+-// wire encoding and checks as a remote seat.
++// delayFrames is the equal delay L, clamped to kMaxDelayFrames. A seat's
++// publish() goes through the same wire encoding and checks as a remote seat.
++// The hub tick is strictly monotonic by construction (one hub, one session).
+ class InMemoryHub
+ {
+ public:
+@@ -296,15 +323,22 @@ public:
+ 	void fail();
+ 
+ 	// Raw wire entry point (also used by tests to inject foreign frames).
+-	FrameCheck submit(const u8 *bytes, u32 size);
++	// fromNode is the sender's identity as known to the transport (the seat
++	// the bytes arrived from), never taken from the frame: a frame whose
++	// nodeId differs is refused as BadHeader. A frame whose localFrame is not
++	// newer than the last one accepted from that node is refused as a replay.
++	FrameCheck submit(int fromNode, const u8 *bytes, u32 size);
+ 	u32 hubTick() const;
++	// Tests only, before any frame: start the hub tick at `tick` (wraparound).
++	void startAtTick(u32 tick);
+ 
+ 	struct Stats
+ 	{
+ 		u32 accepted = 0;
+ 		u32 badEdition = 0;
+ 		u32 badSize = 0;
+-		u32 badHeader = 0;
++		u32 badHeader = 0;		// includes a nodeId that is not the sender's
++		u32 replayed = 0;		// localFrame not newer than the last accepted
+ 	};
+ 	Stats stats() const;
+ 
+@@ -362,6 +396,9 @@ struct MailboxConfig
+ 	RingRole role;
+ 	u32 sessionTag = 0;
+ 	u32 waitMs = 0;		// default for NaomiM3Comm (0: never block the worker)
++	// Consecutive well-formed but not-newer frames before take() reports a
++	// link error (0 = never). See the hubTick invariant above.
++	u32 maxStaleRun = kDefaultMaxStaleRun;
+ };
+ std::unique_ptr<RingBackend> makeMailboxRingBackend(const MailboxConfig& config,
+ 		std::unique_ptr<MailboxIo> io);
+@@ -415,11 +452,17 @@ public:
+ 	virtual u32 read32(u32 wordIndex) const = 0;
+ 	virtual void write32(u32 wordIndex, u32 v) = 0;
+ 	virtual void copyOut(u32 wordIndex, void *dst, u32 bytes) const = 0;
+-	// Direct pointer to the bank if it lives in this address space, else nullptr.
++	// Direct pointer to the bank if it lives in this address space, else
++	// nullptr. Multiboard::dmaStart() reads it unmasked for the DMA length, so
++	// only the native shm backend (native parity) returns non-null; the masked
++	// backends return nullptr and DMA goes through the clamped copyOut().
+ 	virtual const u16 *directData() const { return nullptr; }
+ 
+ 	virtual BarrierResult barrier(u32 timeoutMs) = 0;
+ 	virtual void requestExit() = 0;
++	// The destructor of every backend signals exit as requestExit() does
++	// (native: once, in the shm teardown). Multiboard does not call
++	// requestExit() itself before destroying the backend.
+ 
+ 	// Master, first sync point: start the partner board(s). Returns at once.
+ 	// Sets the number of boards taking part in the barrier to slaves + 1.
+@@ -437,7 +480,9 @@ const MultiboardFactory& multiboardFactory();
+ 
+ // In-process cabinet (both boards in one process, threads or one thread for
+ // tests). Barrier semantics: a generation barrier over the boards in
+-// boardMask, the same as the SAB backend. partnerStarter is called by
++// boardMask, as the SAB backend, except that a board that times out keeps its
++// arrival (as native boardReady does, and so that one thread can complete a
++// barrier in tests); the SAB backend withdraws it. partnerStarter is called by
+ // startPartners() with the board ids to start (may be empty).
+ class InMemoryCabinet
+ {
+diff --git a/core/network/linkbus_web.cpp b/core/network/linkbus_web.cpp
+index 0bdb5aa8e..3fe429dc2 100644
+--- a/core/network/linkbus_web.cpp
++++ b/core/network/linkbus_web.cpp
+@@ -27,6 +27,11 @@
+ 	  Module._linkbus_install_mailbox(slotId, slotCount, edition, sessionTag, waitMs);
+ 	  Module._linkbus_install_sab_multiboard();   // master pair only
+ 
++	Both buffers must be SharedArrayBuffers at least as large as the layout
++	(MailboxLayout::totalBytes, MultiboardSabLayout::totalBytes); otherwise
++	linkbus_install_mailbox returns 3 and the SAB multiboard backend is not
++	created (Multiboard falls back to its default).
++
+ 	  Messages posted by the core:
+ 	    { type: 'linkbus-tx', seq }                       after each slot frame
+ 	    { type: 'linkbus-start-partners', boardId, slaves } master, first sync
+@@ -72,6 +77,17 @@ EM_JS(int, lb_mb_pull, (unsigned char *dst, int capacity, unsigned *seqOut,
+ 	return 0;
+ });
+ 
++// 1 if Module.linkbus.mailbox is a SharedArrayBuffer of at least totalBytes.
++// Drops cached views so that a replaced buffer is picked up.
++EM_JS(int, lb_mb_ok, (int totalBytes), {
++	var lb = Module.linkbus;
++	if (!lb || !lb.mailbox || typeof SharedArrayBuffer === 'undefined'
++			|| !(lb.mailbox instanceof SharedArrayBuffer) || lb.mailbox.byteLength < totalBytes)
++		return 0;
++	lb._mbI32 = null;
++	return 1;
++});
++
+ EM_JS(void, lb_mb_wait, (unsigned seenSeq, int ms, int headerBytes), {
+ 	var lb = Module.linkbus;
+ 	if (!lb || !lb.mailbox || ms <= 0) return;
+@@ -107,9 +123,16 @@ EM_JS(int, lb_mb_error, (int headerBytes), {
+ // JS imports: multiboard cabinet
+ // ---------------------------------------------------------------------------
+ 
+-EM_JS(int, lb_cab_ok, (), {
++// 1 if Module.linkbus.cabinet is a SharedArrayBuffer of at least totalBytes.
++// Drops cached views so that a replaced buffer is picked up.
++EM_JS(int, lb_cab_ok, (int totalBytes), {
+ 	var lb = Module.linkbus;
+-	return lb && lb.cabinet ? 1 : 0;
++	if (!lb || !lb.cabinet || typeof SharedArrayBuffer === 'undefined'
++			|| !(lb.cabinet instanceof SharedArrayBuffer) || lb.cabinet.byteLength < totalBytes)
++		return 0;
++	lb._cabI32 = null;
++	lb._cabU16 = null;
++	return 1;
+ });
+ 
+ EM_JS(int, lb_cab_hdr, (int op, int index, int value), {
+@@ -143,6 +166,10 @@ EM_JS(void, lb_cab_copy_out, (unsigned word, void *dst, int bytes, int dataOffse
+ });
+ 
+ // Generation barrier; returns 0 ok, 1 timeout, 2 exit (slave).
++// Only a generation change releases a board: a notify without one (exit
++// request, spurious wake) waits again for the time left. A board that times
++// out withdraws its arrival bit; if the generation moved meanwhile, the
++// barrier did complete and the result is ok.
+ EM_JS(int, lb_cab_barrier, (int boardId, int timeoutMs), {
+ 	var lb = Module.linkbus;
+ 	var i32 = lb._cabI32 || (lb._cabI32 = new Int32Array(lb.cabinet, 0, 16));
+@@ -157,14 +184,29 @@ EM_JS(int, lb_cab_barrier, (int boardId, int timeoutMs), {
+ 		Atomics.notify(i32, 2);
+ 		return 0;
+ 	}
+-	var r;
+-	try {
+-		r = Atomics.wait(i32, 2, g, timeoutMs);
+-	} catch (e) {
+-		r = 'timed-out';	// main thread: cannot block
++	var now = function () {
++		return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
++	};
++	var deadline = now() + Math.max(timeoutMs, 0);
++	while (Atomics.load(i32, 2) === g) {
++		if (boardId !== 0 && Atomics.load(i32, 1) !== 0) break;
++		var left = deadline - now();
++		if (left <= 0) break;
++		try {
++			Atomics.wait(i32, 2, g, left);
++		} catch (e) {
++			break;	// main thread: cannot block
++		}
+ 	}
+-	if (boardId !== 0 && Atomics.load(i32, 1) !== 0) return 2;
+-	return r === 'timed-out' ? 1 : 0;
++	if (Atomics.load(i32, 2) === g) {
++		// Timed out (or exit): withdraw the arrival, then look again in case
++		// the last board completed the barrier in between.
++		Atomics.and(i32, 3, ~bit);
++		if (Atomics.load(i32, 2) !== g) return 0;
++		if (boardId !== 0 && Atomics.load(i32, 1) !== 0) return 2;
++		return 1;
++	}
++	return 0;
+ });
+ 
+ EM_JS(void, lb_cab_start_partners, (int boardId, int slaves), {
+@@ -213,6 +255,11 @@ constexpr int kData = (int)MultiboardSabLayout::data;
+ class SabBoard : public MultiboardBackend
+ {
+ public:
++	~SabBoard() override {
++		// Teardown signals exit once, from the backend (see linkbus.h).
++		requestExit();
++	}
++
+ 	explicit SabBoard(int boardId) : id(boardId)
+ 	{
+ 		if (id == 0)
+@@ -293,7 +340,7 @@ FramePacer pacer;
+ 
+ std::unique_ptr<MultiboardBackend> makeSabMultiboardBackend(int boardId)
+ {
+-	if (!lb_cab_ok())
++	if (!lb_cab_ok((int)MultiboardSabLayout::totalBytes))
+ 		return nullptr;
+ 	return std::make_unique<SabBoard>(boardId);
+ }
+@@ -312,6 +359,8 @@ EMSCRIPTEN_KEEPALIVE int linkbus_install_mailbox(int slotId, int slotCount, int
+ 		return 1;
+ 	if (edition != (int)Edition::A && edition != (int)Edition::B)
+ 		return 2;
++	if (!lb_mb_ok((int)MailboxLayout::totalBytes))
++		return 3;
+ 	MailboxConfig cfg;
+ 	cfg.role.slotId = slotId;
+ 	cfg.role.slotCount = slotCount;
+diff --git a/tests/linkbus/linkbus_test.cpp b/tests/linkbus/linkbus_test.cpp
+index 2157c384d..13646c3e8 100644
+--- a/tests/linkbus/linkbus_test.cpp
++++ b/tests/linkbus/linkbus_test.cpp
+@@ -299,7 +299,7 @@ TEST(edition_tag_refusal_hub)
+ 	CHECK_EQ(rx3[0], 0x55);
+ 	// A foreign frame injected on the raw wire is refused too.
+ 	auto foreign = makeSlotFrame(2, n, S, Edition::B, 99, 7);
+-	CHECK(hub.submit(foreign.data(), (u32)foreign.size()) == FrameCheck::BadEdition);
++	CHECK(hub.submit(2, foreign.data(), (u32)foreign.size()) == FrameCheck::BadEdition);
+ 	CHECK_EQ(hub.stats().badEdition, 2u);
+ }
+ 
+@@ -692,6 +692,529 @@ TEST(cabinet_barrier_and_exit)
+ 	CHECK(slave->barrier(0) == BarrierResult::Exit);
+ }
+ 
++// ---------------------------------------------------------------------------
++// Review fixes (independent review of d3c70df2e and aed3de564). Several cases
++// are taken from the reviewer's adversarial tests.
++// ---------------------------------------------------------------------------
++
++static std::vector<u8> slotFrameLf(int node, int n, u32 S, u32 localFrame, u8 fill, u32 session = 77)
++{
++	auto f = makeSlotFrame(node, n, S, Edition::A, session, 1);
++	SlotFrameHeader h;
++	std::memcpy(&h, f.data(), sizeof(h));
++	h.localFrame = localFrame;
++	std::memcpy(f.data(), &h, sizeof(h));
++	std::memset(f.data() + sizeof(h), fill, S);
++	return f;
++}
++
++// comm_ram-like buffer with canaries around the RX region.
++struct GuardedRx
++{
++	std::vector<u8> mem;
++	u32 S;
++	int n;
++	GuardedRx(u32 S, int n) : mem(0x100 + S * (n + 1) + 4096, 0xCC), S(S), n(n) {}
++	u8 *base() { return &mem[rxSlotOffset(S, 1)]; }
++	bool canariesIntact() const
++	{
++		for (u32 i = rxSlotOffset(S, 1) + S * n; i < mem.size(); i++)
++			if (mem[i] != 0xCC) return false;
++		for (u32 i = 0; i < rxSlotOffset(S, 1); i++)
++			if (mem[i] != 0xCC) return false;
++		return true;
++	}
++	bool rxIs(u8 v) { for (u32 i = 0; i < S * (u32)n; i++) if (base()[i] != v) return false; return true; }
++};
++
++static std::vector<u8> asmFill(Edition ed, u32 session, int target, int n, u32 S, u32 tick, u16 pn, u8 fill)
++{
++	AssembledFrameHeader h{};
++	h.magic = kAssembledMagic;
++	h.version = kWireVersion;
++	h.edition = (u8)ed;
++	h.targetNode = (u8)target;
++	h.slotCount = (u8)n;
++	h.slotSize = (u16)S;
++	h.prevPacketNumber = pn;
++	h.hubTick = tick;
++	h.releaseFrame = tick;
++	h.sessionTag = session;
++	std::vector<u8> f(sizeof(h) + (size_t)S * n, fill);
++	std::memcpy(f.data(), &h, sizeof(h));
++	return f;
++}
++
++// Finding 5: slotSize * slotCount must fit kMaxPayload.
++TEST(review5_slot_frame_payload_cap)
++{
++	WireExpect e;
++	e.edition = Edition::A;
++	e.sessionTag = 77;
++	auto ok = slotFrameLf(0, 16, 0x400, 0, 1);			// 0x400 * 16 = kMaxPayload
++	CHECK(checkSlotFrame(ok.data(), (u32)ok.size(), e, nullptr) == FrameCheck::Ok);
++	auto over = slotFrameLf(0, 16, 0x401, 0, 1);
++	CHECK(checkSlotFrame(over.data(), (u32)over.size(), e, nullptr) == FrameCheck::BadSize);
++	auto huge = slotFrameLf(0, 16, 0xFFFF, 0, 1);
++	CHECK(checkSlotFrame(huge.data(), (u32)huge.size(), e, nullptr) == FrameCheck::BadSize);
++
++	// Reviewer case: a hostile first frame with slotSize 0xFFFF no longer
++	// teaches the hub its slot size, so honest seats still link.
++	const u32 S = 0x20;
++	const int n = 3;
++	InMemoryHub hub(n, Edition::A, 0, 77);
++	auto s0 = hub.attach(0), s1 = hub.attach(1), s2 = hub.attach(2);
++	auto evil = slotFrameLf(2, n, 0xFFFF, 0, 0x99);
++	CHECK(hub.submit(2, evil.data(), (u32)evil.size()) == FrameCheck::BadSize);
++	std::vector<u8> tx(S * n, 0x12);
++	s0->publish(tx.data(), S, n, 1);
++	s1->publish(tx.data(), S, n, 1);
++	hub.tick();
++	GuardedRx rx(S, n);
++	CHECK(s0->take(rx.base(), S, n, 0).fresh);
++	CHECK(rx.canariesIntact());
++
++	// The mailbox seat does not even send such a frame.
++	std::vector<u8> region(MailboxLayout::totalBytes, 0);
++	MailboxConfig cfg;
++	cfg.role = { 0, 16, Edition::A };
++	cfg.sessionTag = 77;
++	auto ring = makeMailboxRingBackend(cfg, makeBufferMailboxIo(region.data()));
++	std::vector<u8> big(0x401 * 16, 0);
++	CHECK(ring->publish(big.data(), 0x401, 16, 1));
++	u32 txSeq = 0;
++	std::vector<u8> out(16);
++	mailboxReadTx(region.data(), out.data(), (u32)out.size(), &txSeq);
++	CHECK_EQ(txSeq, 0u);
++	CHECK(ring->publish(big.data(), 0x400, 16, 1));
++	mailboxReadTx(region.data(), out.data(), (u32)out.size(), &txSeq);
++	CHECK_EQ(txSeq, 1u);
++}
++
++// Finding 5: the sender identity comes from the transport, not the frame.
++TEST(review5_hub_binds_sender_to_seat)
++{
++	const u32 S = 0x20;
++	const int n = 3;
++	InMemoryHub hub(n, Edition::A, 0, 77);
++	auto s0 = hub.attach(0), s1 = hub.attach(1);
++	std::vector<u8> tx(S * n, 0x12);
++	s1->publish(tx.data(), S, n, 5);
++	// Seat 0's transport carries a frame claiming to be node 1 (same tick).
++	auto imp = slotFrameLf(1, n, S, 1000, 0x77);
++	CHECK(hub.submit(0, imp.data(), (u32)imp.size()) == FrameCheck::BadHeader);
++	CHECK(hub.submit(-1, imp.data(), (u32)imp.size()) == FrameCheck::BadHeader);
++	CHECK(hub.submit(n, imp.data(), (u32)imp.size()) == FrameCheck::BadHeader);
++	CHECK_EQ(hub.stats().badHeader, 3u);
++	hub.tick();
++	GuardedRx rx(S, n);
++	CHECK(s0->take(rx.base(), S, n, 0).fresh);
++	// Node 0: k = 2 is node 1, which must hold seat 1's bytes.
++	CHECK_EQ(rx.base()[S * 1], 0x12);
++	CHECK(rx.canariesIntact());
++	// The same frame from the right transport is accepted.
++	CHECK(hub.submit(1, imp.data(), (u32)imp.size()) == FrameCheck::Ok);
++}
++
++// Finding 5: localFrame must be strictly increasing per node.
++TEST(review5_hub_refuses_replay)
++{
++	const u32 S = 0x20;
++	const int n = 3;
++	InMemoryHub hub(n, Edition::A, 0, 77);
++	auto s0 = hub.attach(0);
++	auto f = slotFrameLf(1, n, S, 3, 0x41);
++	CHECK(hub.submit(1, f.data(), (u32)f.size()) == FrameCheck::Ok);
++	hub.tick();
++	GuardedRx rx(S, n);
++	CHECK(s0->take(rx.base(), S, n, 0).fresh);
++	// Reviewer case: the same frame again is a replay, not a new snapshot.
++	CHECK(hub.submit(1, f.data(), (u32)f.size()) == FrameCheck::BadHeader);
++	auto older = slotFrameLf(1, n, S, 2, 0x42);
++	CHECK(hub.submit(1, older.data(), (u32)older.size()) == FrameCheck::BadHeader);
++	CHECK_EQ(hub.stats().replayed, 2u);
++	hub.tick();
++	CHECK(!s0->take(rx.base(), S, n, 0).fresh);
++	auto newer = slotFrameLf(1, n, S, 4, 0x43);
++	CHECK(hub.submit(1, newer.data(), (u32)newer.size()) == FrameCheck::Ok);
++	// localFrame wraps by signed distance.
++	auto nearWrap = slotFrameLf(2, n, S, 0xFFFFFFFFu, 0x44);
++	auto wrapped = slotFrameLf(2, n, S, 0, 0x45);
++	CHECK(hub.submit(2, nearWrap.data(), (u32)nearWrap.size()) == FrameCheck::Ok);
++	CHECK(hub.submit(2, wrapped.data(), (u32)wrapped.size()) == FrameCheck::Ok);
++	// A seat attached again starts counting from 0 and is accepted.
++	{
++		auto s1 = hub.attach(1);
++		std::vector<u8> tx(S * n, 0x12);
++		s1->publish(tx.data(), S, n, 1);
++		CHECK_EQ(s1->stats().badHeader, 0u);
++	}
++	auto s1b = hub.attach(1);
++	CHECK(s1b != nullptr);
++	std::vector<u8> tx(S * n, 0x13);
++	const u32 before = hub.stats().accepted;
++	s1b->publish(tx.data(), S, n, 1);
++	CHECK_EQ(hub.stats().accepted, before + 1);
++}
++
++// Finding 6: delayFrames is clamped and the release test does not wrap.
++TEST(review6_hub_delay_clamped)
++{
++	const u32 S = 8;
++	const int n = 2;
++	InMemoryHub hub(n, Edition::A, 0xFFFFFFFFu, 77);
++	auto s0 = hub.attach(0), s1 = hub.attach(1);
++	std::vector<u8> tx(S * n, 0x12);
++	s1->publish(tx.data(), S, n, 5);
++	GuardedRx rx(S, n);
++	u32 firstFresh = 0;
++	for (u32 t = 1; t <= kMaxDelayFrames + 5 && firstFresh == 0; t++)
++	{
++		hub.tick();
++		if (s0->take(rx.base(), S, n, 0).fresh)
++			firstFresh = t;
++	}
++	// Published at tick 0, released when tick - 0 >= 1 + L with L = 600.
++	CHECK_EQ(firstFresh, kMaxDelayFrames + 1);
++}
++
++TEST(review6_hub_tick_wraparound_matches_unwrapped)
++{
++	const u32 S = 8;
++	const int n = 2;
++	const u32 L = 2;
++	InMemoryHub plain(n, Edition::A, L, 77), wrap(n, Edition::A, L, 77);
++	wrap.startAtTick(0xFFFFFFF0u);
++	auto p0 = plain.attach(0), p1 = plain.attach(1);
++	auto w0 = wrap.attach(0), w1 = wrap.attach(1);
++	std::vector<u8> rxp(S * n, 0), rxw(S * n, 0);
++	bool same = true;
++	u32 freshCount = 0;
++	for (u32 g = 0; g < 40; g++)
++	{
++		auto s = slotOf(1, S, g);
++		std::vector<u8> tx(S * n, 0);
++		std::memcpy(tx.data(), s.data(), S);
++		p1->publish(tx.data(), S, n, (u16)g);
++		w1->publish(tx.data(), S, n, (u16)g);
++		plain.tick();
++		wrap.tick();
++		TakeResult rp = p0->take(rxp.data(), S, n, 0);
++		TakeResult rw = w0->take(rxw.data(), S, n, 0);
++		if (rp.fresh != rw.fresh || rp.packetNumber != rw.packetNumber || rxp != rxw)
++			same = false;
++		if (rw.fresh)
++			freshCount++;
++	}
++	CHECK(same);
++	CHECK_EQ(freshCount, 40u - L);
++	CHECK(wrap.hubTick() < 0x100u);		// it did wrap
++}
++
++// Finding 3: peekHubTick trusts only frames that pass checkAssembledFrame.
++TEST(review3_mailbox_peek_validates)
++{
++	const u32 S = 0x40;
++	const int n = 3;
++	const int me = 1;
++	const u32 session = 0xA5A5A5A5;
++	std::vector<u8> region(MailboxLayout::totalBytes, 0);
++	MailboxConfig cfg;
++	cfg.role = { me, n, Edition::A };
++	cfg.sessionTag = session;
++	auto ring = makeMailboxRingBackend(cfg, makeBufferMailboxIo(region.data()));
++	FramePacer pacer;
++	auto g = asmFill(Edition::A, session, me, n, S, 100, 0, 0);
++	mailboxDeliver(region.data(), g.data(), (u32)g.size());
++	u32 t = 0;
++	CHECK(ring->peekHubTick(&t));
++	CHECK_EQ(t, 100u);
++	pacer.observeHubTick(t);
++	// Each wrong field alone, with a far-ahead tick.
++	const u32 far = 100 + 1000000;
++	std::vector<std::vector<u8>> bad;
++	bad.push_back(asmFill(Edition::B, session, me, n, S, far, 0, 0));
++	bad.push_back(asmFill(Edition::A, session ^ 0xFF, me, n, S, far, 0, 0));
++	bad.push_back(asmFill(Edition::A, session, me + 1, n, S, far, 0, 0));
++	bad.push_back(asmFill(Edition::A, session, me, n + 1, S, far, 0, 0));
++	{
++		auto f = asmFill(Edition::A, session, me, n, S, far, 0, 0);
++		f.pop_back();
++		bad.push_back(f);
++	}
++	for (auto& b : bad)
++	{
++		mailboxDeliver(region.data(), b.data(), (u32)b.size());
++		CHECK(ring->peekHubTick(&t));
++		CHECK_EQ(t, 100u);
++	}
++	// Reviewer case: legit ticks resume; the pacer runs one frame per tick.
++	u32 ran = 0;
++	for (u32 k = 0; k < 70; k++)
++	{
++		auto f = asmFill(Edition::A, session, me, n, S, 101 + k, 0, 0);
++		mailboxDeliver(region.data(), f.data(), (u32)f.size());
++		if (ring->peekHubTick(&t))
++			pacer.observeHubTick(t);
++		u32 m = pacer.framesToRun();
++		for (u32 i = 0; i < m; i++) { pacer.onFrameRun(); ran++; }
++	}
++	// One credit from tick 100 plus one per legit tick: 71 frames.
++	CHECK_EQ(ran, 71u);
++	// Once a frame is taken the slot size is checked too.
++	GuardedRx rx(S, n);
++	CHECK(ring->take(rx.base(), S, n, 0).fresh);
++	auto wrongSize = asmFill(Edition::A, session, me, n, S / 2, far, 0, 0);
++	mailboxDeliver(region.data(), wrongSize.data(), (u32)wrongSize.size());
++	CHECK(ring->peekHubTick(&t));
++	CHECK_EQ(t, 170u);
++}
++
++TEST(review3_hub_peek_validates)
++{
++	InMemoryHub hub(3, Edition::A, 0);
++	auto a = hub.attach(0);
++	auto foreign = hub.attach(1, Edition::B);	// wrong edition for this hub
++	auto s = slotOf(0, 4);
++	a->publish(s.data(), 4, 3, 1);
++	hub.tick();
++	u32 t = 0;
++	CHECK(!foreign->peekHubTick(&t));	// pending frame is edition A: not trusted
++	CHECK(a->peekHubTick(&t));
++	CHECK_EQ(t, 1u);
++}
++
++// Finding 4: a long run of well-formed but stale frames is a link error.
++TEST(review4_mailbox_stale_run_reports_error)
++{
++	const u32 S = 0x10;
++	const int n = 2;
++	const u32 session = 0x1234;
++	for (u32 limit : { kDefaultMaxStaleRun, 5u })
++	{
++		std::vector<u8> region(MailboxLayout::totalBytes, 0);
++		MailboxConfig cfg;
++		cfg.role = { 0, n, Edition::A };
++		cfg.sessionTag = session;
++		cfg.maxStaleRun = limit;
++		auto ring = makeMailboxRingBackend(cfg, makeBufferMailboxIo(region.data()));
++		GuardedRx rx(S, n);
++		// Reviewer case: one far-ahead tick (hub restarted with the same tag).
++		auto jump = asmFill(Edition::A, session, 0, n, S, 10 + 0x7FFFFFF0u, 1, 0x55);
++		mailboxDeliver(region.data(), jump.data(), (u32)jump.size());
++		CHECK(ring->take(rx.base(), S, n, 0).fresh);
++		u32 errorAt = 0;
++		for (u32 t = 11; t < 11 + limit + 10 && errorAt == 0; t++)
++		{
++			auto f = asmFill(Edition::A, session, 0, n, S, t, 2, 0x66);
++			mailboxDeliver(region.data(), f.data(), (u32)f.size());
++			TakeResult r = ring->take(rx.base(), S, n, 0);
++			CHECK(!r.fresh);
++			if (r.error)
++				errorAt = t - 10;
++		}
++		CHECK_EQ(errorAt, limit);
++		CHECK_EQ(ring->stats().staleTick, limit);
++		CHECK(rx.rxIs(0x55));
++		// Latched: even a newer frame does not clear it.
++		auto later = asmFill(Edition::A, session, 0, n, S, 0x90000000u, 2, 0x77);
++		mailboxDeliver(region.data(), later.data(), (u32)later.size());
++		CHECK(ring->take(rx.base(), S, n, 0).error);
++	}
++	// Repeats (no new seq), refused frames and a fresh frame do not count.
++	{
++		std::vector<u8> region(MailboxLayout::totalBytes, 0);
++		MailboxConfig cfg;
++		cfg.role = { 0, n, Edition::A };
++		cfg.sessionTag = session;
++		cfg.maxStaleRun = 3;
++		auto ring = makeMailboxRingBackend(cfg, makeBufferMailboxIo(region.data()));
++		GuardedRx rx(S, n);
++		auto f10 = asmFill(Edition::A, session, 0, n, S, 10, 1, 1);
++		mailboxDeliver(region.data(), f10.data(), (u32)f10.size());
++		CHECK(ring->take(rx.base(), S, n, 0).fresh);
++		bool anyError = false;
++		for (int round = 0; round < 5; round++)
++		{
++			for (int i = 0; i < 2; i++)
++			{
++				auto old = asmFill(Edition::A, session, 0, n, S, 5, 1, 2);
++				mailboxDeliver(region.data(), old.data(), (u32)old.size());
++				anyError |= ring->take(rx.base(), S, n, 0).error;
++			}
++			for (int i = 0; i < 4; i++)
++				anyError |= ring->take(rx.base(), S, n, 0).error;		// no new seq
++			auto foreign = asmFill(Edition::B, session, 0, n, S, 5, 1, 2);
++			mailboxDeliver(region.data(), foreign.data(), (u32)foreign.size());
++			anyError |= ring->take(rx.base(), S, n, 0).error;
++			auto fresh = asmFill(Edition::A, session, 0, n, S, 11 + (u32)round, 1, 3);
++			mailboxDeliver(region.data(), fresh.data(), (u32)fresh.size());
++			TakeResult r = ring->take(rx.base(), S, n, 0);
++			anyError |= r.error;
++			CHECK(r.fresh);
++		}
++		CHECK(!anyError);
++	}
++	// 0 disables the check.
++	{
++		std::vector<u8> region(MailboxLayout::totalBytes, 0);
++		MailboxConfig cfg;
++		cfg.role = { 0, n, Edition::A };
++		cfg.sessionTag = session;
++		cfg.maxStaleRun = 0;
++		auto ring = makeMailboxRingBackend(cfg, makeBufferMailboxIo(region.data()));
++		GuardedRx rx(S, n);
++		auto f = asmFill(Edition::A, session, 0, n, S, 1000, 1, 1);
++		mailboxDeliver(region.data(), f.data(), (u32)f.size());
++		CHECK(ring->take(rx.base(), S, n, 0).fresh);
++		bool anyError = false;
++		for (u32 i = 0; i < 300; i++)
++		{
++			auto o = asmFill(Edition::A, session, 0, n, S, 500, 1, 1);
++			mailboxDeliver(region.data(), o.data(), (u32)o.size());
++			anyError |= ring->take(rx.base(), S, n, 0).error;
++		}
++		CHECK(!anyError);
++	}
++}
++
++// Finding 7: seq 0 from the pull (lapped JS reader) is not a new frame.
++struct SeqZeroIo : MailboxIo
++{
++	std::unique_ptr<MailboxIo> inner;
++	int failAt = 0;
++	int calls = 0;
++	u32 pullLatest(u8 *dst, u32 cap, u32 *seqOut) override
++	{
++		calls++;
++		if (calls == failAt) { *seqOut = 0; return 0; }
++		return inner->pullLatest(dst, cap, seqOut);
++	}
++	void waitSeq(u32 s, u32 ms) override { inner->waitSeq(s, ms); }
++	void push(const u8 *f, u32 l) override { inner->push(f, l); }
++	bool linkError() override { return inner->linkError(); }
++};
++
++TEST(review7_mailbox_seq_zero_is_not_new)
++{
++	const u32 S = 0x10;
++	const int n = 2;
++	const u32 session = 0xA5A5A5A5;
++	for (u32 waitMs : { 0u, 5u })
++	{
++		std::vector<u8> region(MailboxLayout::totalBytes, 0);
++		auto io = std::make_unique<SeqZeroIo>();
++		io->inner = makeBufferMailboxIo(region.data());
++		SeqZeroIo *raw = io.get();
++		MailboxConfig cfg;
++		cfg.role = { 0, n, Edition::A };
++		cfg.sessionTag = session;
++		auto ring = makeMailboxRingBackend(cfg, std::move(io));
++		GuardedRx rx(S, n);
++		u32 fresh = 0;
++		for (u32 t = 1; t <= 10; t++)
++		{
++			auto f = asmFill(Edition::A, session, 0, n, S, t, (u16)t, (u8)t);
++			mailboxDeliver(region.data(), f.data(), (u32)f.size());
++			if (t == 6)
++				raw->failAt = raw->calls + 1;		// first pull of this take
++			if (ring->take(rx.base(), S, n, waitMs).fresh)
++				fresh++;
++		}
++		auto st = ring->stats();
++		// waitMs 0: take 6 sees seq 0 (stale), take 7 skips one delivery.
++		// waitMs > 0: take 6 pulls again after the wait and gets frame 6.
++		CHECK_EQ(fresh, waitMs == 0 ? 9u : 10u);
++		CHECK_EQ(st.dropped, waitMs == 0 ? 1u : 0u);
++		CHECK_EQ(st.badSize, 0u);
++		CHECK(rx.rxIs(10));
++	}
++}
++
++// Finding 1: the backend destructor signals exit (Multiboard no longer does).
++TEST(review1_cabinet_destructor_signals_exit)
++{
++	InMemoryCabinet cab;
++	auto master = cab.attach(0);
++	auto slave = cab.attach(1);
++	master->startPartners(1);
++	CHECK(slave->barrier(0) == BarrierResult::Timeout);
++	master.reset();
++	CHECK(slave->barrier(0) == BarrierResult::Exit);
++}
++
++// Finding 10: no direct pointer for a masked backend; copyOut is clamped.
++TEST(review10_cabinet_direct_data_null_and_copy_clamped)
++{
++	InMemoryCabinet cab;
++	auto m = cab.attach(0);
++	CHECK(m->directData() == nullptr);
++	m->write32(kMbDataWords - 2, 0xAABBCCDD);
++	std::vector<u8> buf(64, 0xCC);
++	m->copyOut(kMbDataWords - 2, buf.data(), 64);	// what dmaStart would ask for
++	u32 v = 0;
++	std::memcpy(&v, buf.data(), 4);
++	CHECK_EQ(v, 0xAABBCCDDu);
++	bool untouched = true;
++	for (size_t i = 4; i < buf.size(); i++)
++		if (buf[i] != 0xCC) untouched = false;
++	CHECK(untouched);
++	// Unmasked high index (dmaStart srcWord) wraps into the bank.
++	m->copyOut(kMbDataWords + kMbDataWords - 2, buf.data(), 64);
++	std::memcpy(&v, buf.data(), 4);
++	CHECK_EQ(v, 0xAABBCCDDu);
++}
++
++// Reviewer case: hostile assembled frames never touch the RX region.
++TEST(review_mailbox_hostile_frames_leave_rx_untouched)
++{
++	const u32 S = 0x40;
++	const int n = 5;
++	const int me = 2;
++	const u32 session = 0xA5A5A5A5;
++	std::vector<u8> region(MailboxLayout::totalBytes, 0);
++	MailboxConfig cfg;
++	cfg.role = { me, n, Edition::A };
++	cfg.sessionTag = session;
++	auto ring = makeMailboxRingBackend(cfg, makeBufferMailboxIo(region.data()));
++	GuardedRx rx(S, n);
++	std::memset(rx.base(), 0x11, S * n);
++	std::vector<std::vector<u8>> bads;
++	bads.push_back(asmFill(Edition::B, session, me, n, S, 1, 7, 0xEE));
++	bads.push_back(asmFill(Edition::A, session ^ 1, me, n, S, 1, 7, 0xEE));
++	bads.push_back(asmFill(Edition::A, session, me + 1, n, S, 1, 7, 0xEE));
++	bads.push_back(asmFill(Edition::A, session, me, n + 1, S, 1, 7, 0xEE));
++	bads.push_back(asmFill(Edition::A, session, me, n, S * 2, 1, 7, 0xEE));
++	bads.push_back(asmFill(Edition::A, session, me, 255, 0x40, 1, 7, 0xEE));
++	{ auto f = asmFill(Edition::A, session, me, n, S, 1, 7, 0xEE); f.resize(f.size() - 1); bads.push_back(f); }
++	{ auto f = asmFill(Edition::A, session, me, n, S, 1, 7, 0xEE); f.push_back(0); bads.push_back(f); }
++	for (auto& b : bads)
++	{
++		mailboxDeliver(region.data(), b.data(), (u32)b.size());
++		TakeResult r = ring->take(rx.base(), S, n, 0);
++		CHECK(!r.fresh);
++		CHECK(!r.error);
++		CHECK(rx.rxIs(0x11));
++		CHECK(rx.canariesIntact());
++	}
++	// Hostile length word and index in the mailbox header.
++	auto f = asmFill(Edition::A, session, me, n, S, 2, 7, 0x22);
++	mailboxDeliver(region.data(), f.data(), (u32)f.size());
++	u32 idx;
++	std::memcpy(&idx, &region[MailboxLayout::latestIndex], 4);
++	const u32 huge = 0xFFFFFFFFu;
++	std::memcpy(&region[MailboxLayout::rxLength + 4 * idx], &huge, 4);
++	CHECK(!ring->take(rx.base(), S, n, 0).fresh);
++	CHECK(rx.canariesIntact());
++	std::memcpy(&region[MailboxLayout::latestIndex], &huge, 4);
++	u32 seq;
++	std::memcpy(&seq, &region[MailboxLayout::seq], 4);
++	seq++;
++	std::memcpy(&region[MailboxLayout::seq], &seq, 4);
++	ring->take(rx.base(), S, n, 0);
++	CHECK(rx.canariesIntact());
++}
++
+ int main()
+ {
+ 	for (auto& t : registry())
+diff --git a/tests/linkbus/run-tests.sh b/tests/linkbus/run-tests.sh
+index 42f97a845..5eb9ccc66 100644
+--- a/tests/linkbus/run-tests.sh
++++ b/tests/linkbus/run-tests.sh
+@@ -3,6 +3,7 @@
+ # Copyright (C) 2026 John R Reeves III
+ # SPDX-License-Identifier: GPL-2.0-or-later
+ # Usage: tests/linkbus/run-tests.sh <emsdk dir> [out dir]
++# Extra compiler flags from LINKBUS_TEST_FLAGS, e.g. "-fsanitize=address".
+ set -e
+ EMSDK_DIR=${1:?emsdk dir}
+ HERE=$(cd "$(dirname "$0")" && pwd)
+@@ -15,6 +16,6 @@ EMCC="$EMSDK_DIR/upstream/emscripten/emcc.py"
+ NODE=$(ls "$EMSDK_DIR"/node/*/node.exe "$EMSDK_DIR"/node/*/bin/node 2>/dev/null | head -n 1)
+ PY=$(ls "$EMSDK_DIR"/python/*/python.exe 2>/dev/null | head -n 1)
+ PY=${PY:-python3}
+-"$PY" "$EMCC" -std=c++17 -O1 -Wall -Wextra -fexceptions -sENVIRONMENT=node -sEXIT_RUNTIME=1 \
++"$PY" "$EMCC" -std=c++17 -O1 -Wall -Wextra -fexceptions -sENVIRONMENT=node -sEXIT_RUNTIME=1 $LINKBUS_TEST_FLAGS \
+ 	-I"$ROOT/core" "$ROOT/core/network/linkbus.cpp" "$HERE/linkbus_test.cpp" -o "$OUT/linkbus_test.js"
+ "$NODE" "$OUT/linkbus_test.js"
+-- 
+2.56.0.windows.3
+

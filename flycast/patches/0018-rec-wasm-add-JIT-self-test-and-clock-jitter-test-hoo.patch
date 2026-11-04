@@ -1,0 +1,321 @@
+From da3209adedac478d5eeda5dbfd222df5f0ec99a1 Mon Sep 17 00:00:00 2001
+From: John R Reeves III <johnreevesiii@outlook.com>
+Date: Mon, 2 Nov 2026 08:35:50 -0800
+Subject: [PATCH 18/22] rec-wasm: add JIT self-test and clock jitter test hooks
+
+fly_jit_selftest() checks, in a booted core, fly_block_idle_ff on SH4
+self-loops decoded by the real decoder (pure poll and bare wait must
+qualify; a poll with a dt timeout, a calibration counter, static
+loops with a store or a counter, and polls with pref or a store must
+not) and that an or.b #imm,@(R0,GBR) store through wasm_exec_ifb bumps
+the written page's generation, with a control that the bare
+interpreter handler does not. It borrows and restores the last 4 KB of
+RAM. Driven by host/tools/jit-selftest.mjs.
+
+fly_test_clock_jitter(seed, max_us) adds a seeded, growing
+pseudo-random skew to the JIT's wall clock. Every budget and timing
+read in rec_wasm.cpp now goes through fly_now(), which is
+emscripten_get_now() while the hook is off (the default). With
+different seeds mode 0's budgets decide differently and the guest
+diverges; mode 1 must not (host/tools/det-jitter-test.mjs).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MGX7KQ5gfrWApgW64pZbQ5
+---
+ core/rec-wasm/rec_wasm.cpp | 166 ++++++++++++++++++++++++++++++++-----
+ 1 file changed, 145 insertions(+), 21 deletions(-)
+
+diff --git a/core/rec-wasm/rec_wasm.cpp b/core/rec-wasm/rec_wasm.cpp
+index 5579b6896..4d69bdd68 100644
+--- a/core/rec-wasm/rec_wasm.cpp
++++ b/core/rec-wasm/rec_wasm.cpp
+@@ -604,13 +604,39 @@ static inline void primeDispatchEntry(u32 vaddr, u32 sh4_code_size, u32 table_id
+ // 0 (off) keeps the wall-clock budgets and async compiles.
+ static int g_fly_det = 0;
+ extern "C" void fly_set_deterministic(int on) { g_fly_det = (on < 0 || on > 2) ? 1 : on; }
++// Wall clock for every budget and timing decision in this file. Test hook:
++// fly_test_clock_jitter(seed, max_us) adds a growing pseudo-random skew (0
++// to max_us per read, from a seeded LCG) so two runs with different seeds
++// see different elapsed times. Mode 0 budgets then decide differently and
++// the guest diverges; mode 1 must not, because it consults no wall-clock
++// budget (the determinism-jitter test checks both). Off (max_us 0) by
++// default, then fly_now() is emscripten_get_now().
++static u32 g_fly_clock_jitter_seed = 0;
++static u32 g_fly_clock_jitter_max_us = 0;
++static double g_fly_clock_skew_ms = 0;
++extern "C" void EMSCRIPTEN_KEEPALIVE fly_test_clock_jitter(u32 seed, u32 max_us)
++{
++	g_fly_clock_jitter_seed = seed;
++	g_fly_clock_jitter_max_us = max_us;
++	g_fly_clock_skew_ms = 0;
++}
++static inline double fly_now()
++{
++	double t = emscripten_get_now();
++	if (g_fly_clock_jitter_max_us) {
++		g_fly_clock_jitter_seed = g_fly_clock_jitter_seed * 1664525u + 1013904223u;
++		g_fly_clock_skew_ms += (double)((g_fly_clock_jitter_seed >> 8) % (g_fly_clock_jitter_max_us + 1)) / 1000.0;
++		t += g_fly_clock_skew_ms;
++	}
++	return t;
++}
+ #define g_defer_runtime (FLY_DEFER_ON && g_fly_det != 2)
+ // Chains built (synchronously) per frame by the deterministic chain sweep.
+ #define FLY_DET_CHAIN_BUILDS 16
+ #define FLY_FRAME_BUDGET_MS 24.0
+ static double g_frame_start_ms = 0;   // stamped at mainloop entry
+ static inline bool fly_frame_over_budget() {
+-	return emscripten_get_now() - g_frame_start_ms > FLY_FRAME_BUDGET_MS;
++	return fly_now() - g_frame_start_ms > FLY_FRAME_BUDGET_MS;
+ }
+ static bool g_compile_defer = false;   // set around over-budget rdv calls
+ static u32 g_defer_count = 0, g_drain_count = 0, g_defer_drop_count = 0;
+@@ -1683,6 +1709,104 @@ static inline void fly_bridge_idle_ff(const RuntimeBlockInfo* block)
+ 		ctx.cycle_counter = 32;
+ }
+ 
++// ============================================================
++// JIT self-test (test hook, called from host/tools/jit-selftest.mjs)
++// ============================================================
++// Runs against the live core after a game has loaded (memory map up). It
++// borrows the last 4 KB page of main RAM, restores it afterwards and bumps
++// its page generation so any cached block there re-verifies. Do not call it
++// in a run whose hashes matter. Returns a failure mask (0 = all pass) and
++// prints one line per check.
++//  bits 0..7: fly_block_idle_ff on decoded SH4 loops (expected value below)
++//  bit 8: an ifb store (or.b #imm,@(R0,GBR)) through wasm_exec_ifb did not
++//         bump g_fly_page_gen for the written page
++//  bit 9: the ifb store did not reach RAM (test setup broken)
++//  bit 10: WriteMem* pointers were not restored after the ifb op
++//  bit 11: control: the same store through OpPtr without the guard DID bump
++//          (would make bit 8 meaningless)
++//  bit 12: a test block failed to decode
++extern "C" u32 EMSCRIPTEN_KEEPALIVE fly_jit_selftest()
++{
++	Sh4Context& ctx = Sh4cntx;
++	const u32 off = (RAM_SIZE - 0x1000) & RAM_MASK;
++	const u32 base = 0x8C000000u | off;
++	static u8 saved[0x1000];
++	memcpy(saved, &mem_b[off], sizeof(saved));
++	u32 fails = 0;
++
++	struct Case { const char* name; u16 code[6]; u32 n; bool expect; };
++	static const Case cases[] = {
++		// L: mov.l @r4,r0; tst #1,r0; bt L        pure poll
++		{ "poll", { 0x6042, 0xC801, 0x89FC, 0x0009 }, 4, true },
++		// L: mov.l @r4,r0; tst #1,r0; bf/s L; dt r5   poll with timeout
++		{ "poll-timeout", { 0x6042, 0xC801, 0x8FFC, 0x4510, 0x0009 }, 5, false },
++		// L: add #1,r1; mov.l @r2,r0; tst #1,r0; bt L   calibration
++		{ "calibration", { 0x7101, 0x6022, 0xC801, 0x89FB, 0x0009 }, 5, false },
++		// L: add #1,r0; mov.l r0,@r1; bra L; nop   static loop with a store
++		{ "static-store", { 0x7001, 0x2102, 0xAFFC, 0x0009 }, 4, false },
++		// L: bra L; nop   bare wait
++		{ "static-wait", { 0xAFFE, 0x0009 }, 2, true },
++		// L: mov.l @r4,r0; pref @r1; tst #1,r0; bt L   poll with pref
++		{ "poll-pref", { 0x6042, 0x0183, 0xC801, 0x89FB, 0x0009 }, 5, false },
++		// L: mov.l @r4,r0; mov.l r0,@r6; tst #1,r0; bt L   poll with store
++		{ "poll-store", { 0x6042, 0x2602, 0xC801, 0x89FB, 0x0009 }, 5, false },
++		// L: add #1,r1; bra L; nop   static counter, no memory
++		{ "static-count", { 0x7101, 0xAFFD, 0x0009 }, 3, false },
++	};
++	for (u32 ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ci++) {
++		const Case& c = cases[ci];
++		for (u32 k = 0; k < c.n; k++)
++			*(u16*)&mem_b[off + k * 2] = c.code[k];
++		RuntimeBlockInfo* blk = new RuntimeBlockInfo();
++		bool ok = blk->Setup(base, ctx.fpscr);
++		bool got = ok && fly_block_idle_ff(blk);
++		if (!ok)
++			fails |= 1u << 12;
++		if (!ok || got != c.expect)
++			fails |= 1u << ci;
++		printf("[selftest] idle_ff %-13s ops=%u type=%u expect=%d got=%d %s\n",
++			c.name, ok ? (u32)blk->oplist.size() : 0u, ok ? blk->BlockType : 0u,
++			c.expect, got, (ok && got == c.expect) ? "PASS" : "FAIL");
++		delete blk;
++	}
++
++	// ifb store: or.b #0x5A,@(R0,GBR) (0xCF5A) decodes to shop_ifb
++	{
++		const u32 page = off >> 12;
++		const u32 save_r0 = ctx.r[0], save_gbr = ctx.gbr;
++		WriteMem8Func w8 = WriteMem8; WriteMem16Func w16 = WriteMem16;
++		WriteMem32Func w32 = WriteMem32; WriteMem64Func w64 = WriteMem64;
++		ctx.r[0] = 0x10;
++		ctx.gbr = base;
++		mem_b[off + 0x10] = 0x00;
++		u32 g0 = g_fly_page_gen[page];
++		wasm_exec_ifb(0xCF5A, base);
++		u32 g1 = g_fly_page_gen[page];
++		bool bumped = g1 != g0;
++		bool stored = mem_b[off + 0x10] == 0x5A;
++		bool restored = WriteMem8 == w8 && WriteMem16 == w16 && WriteMem32 == w32 && WriteMem64 == w64;
++		if (!bumped) fails |= 1u << 8;
++		if (!stored) fails |= 1u << 9;
++		if (!restored) fails |= 1u << 10;
++		// Control: the bare interpreter handler (no guard) must not bump.
++		mem_b[off + 0x10] = 0x00;
++		u32 g2 = g_fly_page_gen[page];
++		OpPtr[0xCF5A](&ctx, 0xCF5A);
++		bool ctrl_bumped = g_fly_page_gen[page] != g2;
++		if (ctrl_bumped) fails |= 1u << 11;
++		printf("[selftest] ifb or.b gen %u->%u stored=%d restored=%d control_bump=%d %s\n",
++			g0, g1, stored, restored, ctrl_bumped,
++			(bumped && stored && restored && !ctrl_bumped) ? "PASS" : "FAIL");
++		ctx.r[0] = save_r0;
++		ctx.gbr = save_gbr;
++	}
++
++	memcpy(&mem_b[off], saved, sizeof(saved));
++	fly_ram_written(base, sizeof(saved));
++	printf("[selftest] done fails=0x%x\n", fails);
++	return fails;
++}
++
+ // === MODE SWITCH (defined above ref_execute_block) ===
+ // 0 = ref (per-instruction charging)
+ // 1 = SHIL with guest_offs-based per-instruction charging
+@@ -5664,16 +5788,16 @@ static void fly_region_pipeline_tick()
+ 								for (u32 pi = 0; pi < (u32)mem.size(); pi++)
+ 									pctab[pi] = mem[pi]->vaddr;
+ 							WasmModuleBuilder rb;
+-							double rt0 = emscripten_get_now();
++							double rt0 = fly_now();
+ 							bool built = buildRegionModule(rb, mem, rc.first_page, rc.last_page, cell,
+ 								icc, (u32)g_regions.size(), rasc, pctab);
+-							double buildMs = emscripten_get_now() - rt0;
++							double buildMs = fly_now() - rt0;
+ 							if (built) {
+ 								const auto& rbytes = rb.getBytes();
+ 								u32 rkey = 0xFFFF0000u + (u32)g_regions.size();
+-								double ct0 = emscripten_get_now();
++								double ct0 = fly_now();
+ 								int ridx = wasm_compile_chain(rbytes.data(), (u32)rbytes.size(), rkey);
+-								double compMs = emscripten_get_now() - ct0;
++								double compMs = fly_now() - ct0;
+ #if FLY_REGIONS_LIVE || FLY_REGION_SHADOW
+ 								if (ridx > 0) {
+ 									// Register + index members. LIVE: prime heads
+@@ -5856,9 +5980,9 @@ public:
+ #endif
+ 			g_defer_count++;
+ 		} else {
+-			double fly_compile_t0 = emscripten_get_now();
++			double fly_compile_t0 = fly_now();
+ 			int table_idx = wasm_compile_block(bytes.data(), (u32)bytes.size(), block->vaddr);
+-			double fly_compile_ms = emscripten_get_now() - fly_compile_t0;
++			double fly_compile_ms = fly_now() - fly_compile_t0;
+ 			FLY_EVT(FLY_EVT_BLOCK_COMPILE,
+ 			        block->vaddr,
+ 			        (u32)bytes.size(),
+@@ -6083,7 +6207,7 @@ public:
+ 		// Sh4Interpreter::Instance is now set in Sh4Recompiler's constructor
+ 		// (ngen.h) — the redundant top-of-mainloop workaround was removed.
+ 		fly_init();
+-		g_frame_start_ms = emscripten_get_now();
++		g_frame_start_ms = fly_now();
+ 		g_defer_execs.clear();
+ 		g_bridged_this_frame = 0;
+ 		// Async compiles resolve between rAF frames — promote them before
+@@ -6172,10 +6296,10 @@ public:
+ 			int cs_scan_budget  = cs_det ? 512 : (cs_burst ? 512 : 64);
+ 			int cs_build_budget = cs_det ? FLY_DET_CHAIN_BUILDS : (cs_burst ? 64 : 8);
+ 			const double cs_ms_cap = cs_burst ? 2.0 : 0.5;
+-			double cs_t0 = emscripten_get_now();
++			double cs_t0 = fly_now();
+ 			int cs_built_this = 0;
+ 			while (cs_scan_budget-- > 0 && cs_build_budget > 0 && cs_pos < cs_sweep.size()) {
+-				if (!cs_det && emscripten_get_now() - cs_t0 > cs_ms_cap)
++				if (!cs_det && fly_now() - cs_t0 > cs_ms_cap)
+ 					break;
+ 				u32 v = cs_sweep[cs_pos++];
+ 				if (g_chain_by_head.count(v) || g_chain_pending.count(v)) continue;
+@@ -6351,7 +6475,7 @@ public:
+ 		u32 fly_frame_idx = s_fly_frame_idx++;
+ 		FLY_EVT(FLY_EVT_FRAME_BEGIN, fly_frame_idx, 0, 0, 0);
+ #if FLY_THROTTLE_FRAME_MS > 0
+-		double fly_throttle_t0 = emscripten_get_now();  // ISOLATION: pad frame to ~9fps
++		double fly_throttle_t0 = fly_now();  // ISOLATION: pad frame to ~9fps
+ #endif
+ #ifdef __EMSCRIPTEN__
+ 		// Live A/B dispatch toggle — set Module._useCleanDispatch=1 in the console.
+@@ -6859,7 +6983,7 @@ public:
+ 											// flushes the whole queue (it is in it); a
+ 											// block not queued (dropped at a flush as
+ 											// stale, or replaced) is decoded and queued.
+-											double t0 = emscripten_get_now();
++											double t0 = fly_now();
+ 											if (g_batch_pending.count(miss_pc)) {
+ 												if (force_hot)
+ 													flushBlockBatch();
+@@ -6871,13 +6995,13 @@ public:
+ 												g_compile_defer = false;
+ 												compilesThisFrame++;
+ 											}
+-											compileTimeThisFrame += (emscripten_get_now() - t0);
++											compileTimeThisFrame += (fly_now() - t0);
+ 										} else if (!g_defer_runtime
+ 										    || (force_hot && compileTimeThisFrame < fly_sync_budget)) {
+-											double t0 = emscripten_get_now();
++											double t0 = fly_now();
+ 											rdv_FailedToFindBlock(miss_pc);
+ 											compilesThisFrame++;
+-											compileTimeThisFrame += (emscripten_get_now() - t0);
++											compileTimeThisFrame += (fly_now() - t0);
+ 										} else if (g_batch_pending.count(miss_pc)) {
+ 											// Queued (and not hot) — bridge below; skipping
+ 											// rdv also kills re-decode churn.
+@@ -6893,12 +7017,12 @@ public:
+ 											// working set natively THIS frame.
+ 											g_compile_defer = true;
+ 											g_compile_batch = true;
+-											double t0 = emscripten_get_now();
++											double t0 = fly_now();
+ 											rdv_FailedToFindBlock(miss_pc);
+ 											g_compile_batch = false;
+ 											g_compile_defer = false;
+ 											compilesThisFrame++;
+-											compileTimeThisFrame += (emscripten_get_now() - t0);
++											compileTimeThisFrame += (fly_now() - t0);
+ 										}
+ 										// ★ STORM FLUSH: mid-frame sync batch compile once the
+ 										// queue is deep — normal frames never reach this depth;
+@@ -6971,7 +7095,7 @@ public:
+ 								// the SHIL fallback below, charging block->guest_cycles —
+ 								// guest timing identical to compiled execution, unlike the
+ 								// old interp fallback.
+-								double t0 = emscripten_get_now();
++								double t0 = fly_now();
+ 								// Batch-first (2026-07-18): fresh blocks queue for the
+ 								// frame's single batched sync Module instead of paying
+ 								// ~1ms per-module sync overhead each — the transition
+@@ -6988,7 +7112,7 @@ public:
+ 								if (g_fly_det == 1 && g_batch_blocks.size() >= FLY_STORM_FLUSH_DEPTH)
+ 									flushBlockBatch();
+ 								it = blockByVaddr.find(miss_pc);
+-								compileTimeThisFrame += (emscripten_get_now() - t0);
++								compileTimeThisFrame += (fly_now() - t0);
+ 								if (it != blockByVaddr.end()) {
+ 									// Compiled — execute via SHIL interpreter
+ 									RuntimeBlockInfo* block = it->second;
+@@ -7127,7 +7251,7 @@ public:
+ 		// FRAME_BEGIN→END) — splits emu.render() into mainloop vs glue.
+ 		{
+ 			extern double g_fly_rp[10];
+-			g_fly_rp[8] += emscripten_get_now() - g_frame_start_ms;
++			g_fly_rp[8] += fly_now() - g_frame_start_ms;
+ 		}
+ #endif
+ 
+@@ -7137,7 +7261,7 @@ public:
+ 		// ISOLATION: busy-spin to pad this frame to ~FLY_THROTTLE_FRAME_MS wall-clock,
+ 		// keeping emulated work identical, to replicate the slow-motion condition
+ 		// under which the clean dispatch showed no glitches.
+-		while (emscripten_get_now() - fly_throttle_t0 < (double)FLY_THROTTLE_FRAME_MS) { }
++		while (fly_now() - fly_throttle_t0 < (double)FLY_THROTTLE_FRAME_MS) { }
+ #endif
+ 		// Promote deferred blocks with whatever frame budget remains (always
+ 		// at least one — see drainCompileQueue).
+-- 
+2.56.0.windows.3
+

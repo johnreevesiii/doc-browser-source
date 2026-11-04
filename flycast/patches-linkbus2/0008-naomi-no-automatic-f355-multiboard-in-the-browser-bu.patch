@@ -1,0 +1,57 @@
+From 21b2dcbec0ab25bb149f64ef2ad05810d0965b94 Mon Sep 17 00:00:00 2001
+From: John R Reeves III <johnreevesiii@outlook.com>
+Date: Mon, 2 Nov 2026 13:49:23 -0800
+Subject: [PATCH 8/9] naomi: no automatic f355 multiboard in the browser build
+ (review F9)
+
+With LINKBUS_MULTIBOARD on, NAOMI_MULTIBOARD also turned on the f355
+automatic multiboard switch in naomi_cart.cpp, so an f355 set in the
+browser would have built a Multiboard without a host backend. Under
+__EMSCRIPTEN__ only MultiboardSlaves 2 (the DOC cabinet host) turns it
+on. The driving simulator path was already native only. The CMakeLists
+comment now says what the option gates.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MGX7KQ5gfrWApgW64pZbQ5
+---
+ CMakeLists.txt               | 5 +++--
+ core/hw/naomi/naomi_cart.cpp | 7 ++++++-
+ 2 files changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 4a5a641b8..a173fcbb7 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -106,8 +106,9 @@ option(USE_XBRZ "Build the xBRZ texture upscaler (GPL-3.0)" ON)
+ # five-board cabinet. It only takes effect when the host sets
+ # MultiboardSlaves = 2 (or BoardId != 0) and installs a SAB backend; the
+ # libretro default (MultiboardSlaves 0) leaves DOC a single board as before.
+-# Side effect: the f355 and sgdrvsim table entries (gated by
+-# NAOMI_MULTIBOARD) are now in the browser build too.
++# NAOMI_MULTIBOARD also gates the f355 automatic multiboard switch, which
++# naomi_cart.cpp leaves off in the browser (only MultiboardSlaves 2 turns it
++# on), and the driving simulator path, which stays native only.
+ option(LINKBUS_MULTIBOARD "Emscripten: build the NAOMI multiboard class over the LinkBus SAB backend" ON)
+ 
+ if(IOS AND NOT LIBRETRO)
+diff --git a/core/hw/naomi/naomi_cart.cpp b/core/hw/naomi/naomi_cart.cpp
+index f1339a959..18933c062 100644
+--- a/core/hw/naomi/naomi_cart.cpp
++++ b/core/hw/naomi/naomi_cart.cpp
+@@ -821,7 +821,12 @@ int naomi_cart_GetPlatform(const char *path)
+ 		return DC_PLATFORM_SYSTEMSP;
+ 	else
+ 	{
+-#ifdef NAOMI_MULTIBOARD
++#if defined(NAOMI_MULTIBOARD) && defined(__EMSCRIPTEN__)
++		// Browser: only when the host asks for it (MultiboardSlaves 2, as the
++		// DOC cabinet does), never automatically for f355.
++		if (game->multiboard > 0 && config::MultiboardSlaves == 2)
++			settings.naomi.multiboard = true;
++#elif defined(NAOMI_MULTIBOARD)
+ 		if (game->multiboard > 0
+ 				&& (!strncmp("f355", game->name, 4) || config::MultiboardSlaves == 2))
+ 			settings.naomi.multiboard = true;
+-- 
+2.56.0.windows.3
+

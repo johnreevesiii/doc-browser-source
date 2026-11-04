@@ -1,0 +1,910 @@
+From b620af890268450c13a79803abec50dd9500ab43 Mon Sep 17 00:00:00 2001
+From: John R Reeves III <johnreevesiii@outlook.com>
+Date: Mon, 2 Nov 2026 07:00:07 -0800
+Subject: [PATCH 2/9] linkbus: multiboard backend seam and opt-in browser
+ multiboard
+
+Multiboard now reaches its shared bank, status word, barrier, partner
+start and keyboard pipe through linkbus::MultiboardBackend. The native
+default is ShmMultiboardBackend in multiboard.cpp: the OS shared memory,
+IPC mutex and condition variable, two-phase barrier, os_RunInstance()
+partner spawn and keyboard pipe, moved without change of behaviour
+(unmasked bank indexing, phase 1 timeout returns early, phase 2 timeout
+continues, slave exit throws "Slave exit"). Bank and offset arithmetic
+stays in Multiboard.
+
+A host can install a factory (linkbus::setMultiboardFactory); the browser
+uses the SAB backend from linkbus_web.cpp. New CMake option
+LINKBUS_MULTIBOARD (default OFF) defines NAOMI_MULTIBOARD for Emscripten
+builds; the shm backend and the driving simulator spawn stay out of
+Emscripten builds. Default builds are unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MGX7KQ5gfrWApgW64pZbQ5
+---
+ CMakeLists.txt               |   4 +
+ core/build.h                 |   5 +
+ core/hw/naomi/multiboard.cpp | 588 +++++++++++++++++++++--------------
+ core/hw/naomi/multiboard.h   |  13 +-
+ core/hw/naomi/naomi_cart.cpp |   2 +-
+ tests/linkbus/.gitattributes |   1 +
+ 6 files changed, 373 insertions(+), 240 deletions(-)
+ create mode 100644 tests/linkbus/.gitattributes
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 8db85cd80..4f13036d6 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -101,6 +101,7 @@ option(ENABLE_FC_PROFILER "Build with support for host app (Flycast) profiler" O
+ option(USE_DISCORD "Use Discord Presence API" OFF)
+ option(USE_LIBCDIO "Use libcdio for CDROM access" OFF)
+ option(USE_XBRZ "Build the xBRZ texture upscaler (GPL-3.0)" ON)
++option(LINKBUS_MULTIBOARD "Emscripten: build the NAOMI multiboard class over the LinkBus SAB backend" OFF)
+ 
+ if(IOS AND NOT LIBRETRO)
+ 	set(USE_VULKAN OFF CACHE BOOL "Force vulkan off" FORCE)
+@@ -947,6 +948,9 @@ if(USE_XBRZ)
+ else()
+ 	target_compile_definitions(${PROJECT_NAME} PRIVATE NO_XBRZ)
+ endif()
++if(EMSCRIPTEN AND LINKBUS_MULTIBOARD)
++	target_compile_definitions(${PROJECT_NAME} PRIVATE LINKBUS_MULTIBOARD)
++endif()
+ target_sources(${PROJECT_NAME} PRIVATE core/deps/md5/md5.cpp)
+ 
+ if(USE_DISCORD AND NOT LIBRETRO)
+diff --git a/core/build.h b/core/build.h
+index 07c7738bf..8bf28c773 100755
+--- a/core/build.h
++++ b/core/build.h
+@@ -120,6 +120,11 @@
+ 	&& !defined(__SWITCH__) && !defined(LIBRETRO) && !defined(__NetBSD__) && !defined(__OpenBSD__)
+ #define NAOMI_MULTIBOARD
+ #endif
++// LinkBus (PLAN_V2 2.10): the browser build can run the multiboard class over
++// a SharedArrayBuffer backend installed by the host page (opt-in).
++#if defined(__EMSCRIPTEN__) && defined(LINKBUS_MULTIBOARD) && !defined(NAOMI_MULTIBOARD)
++#define NAOMI_MULTIBOARD
++#endif
+ 
+ // TARGET PLATFORM
+ #define GD_CLOCK 33868800						//GDROM XTAL -- 768fs
+diff --git a/core/hw/naomi/multiboard.cpp b/core/hw/naomi/multiboard.cpp
+index 386365f95..4e4d13434 100644
+--- a/core/hw/naomi/multiboard.cpp
++++ b/core/hw/naomi/multiboard.cpp
+@@ -37,14 +37,22 @@
+ #include "hw/holly/sb.h"
+ #include "ui/gui.h"
+ #include "oslib/i18n.h"
++#include "network/linkbus.h"
+ #include <atomic>
++#include <vector>
+ 
+ using namespace i18n;
+ 
+ constexpr int BaseSyncCycles = 836208;	// 4 times per frame
++static_assert(BaseSyncCycles == linkbus::kMbBaseSyncCycles, "LinkBus sync period");
+ constexpr u32 G1_BASE = 0x05F7080;
+ constexpr u32 G2_BASE = 0x1010000;
++constexpr size_t MEM_SIZE = 0x100000 / sizeof(u16);
++static_assert(MEM_SIZE == linkbus::kMbDataWords, "LinkBus bank size");
+ 
++#ifndef __EMSCRIPTEN__
++// Native shared memory backend (LinkBus "Shm"). Not built for the browser,
++// where the host page provides a SharedArrayBuffer backend instead.
+ #ifdef _WIN32
+ #include <winsock2.h>
+ #include <windows.h>
+@@ -272,8 +280,6 @@ struct PipeData
+ 	IpcMutex mutex;
+ };
+ 
+-constexpr size_t MEM_SIZE = 0x100000 / sizeof(u16);
+-
+ struct SharedMemory
+ {
+ 	std::atomic<u16> status;
+@@ -339,71 +345,307 @@ struct MultiKeyboard : public Pipe<KeyboardEvent, 16>
+ 	 {}
+ };
+ 
+-Multiboard *Multiboard::Instance;
+-
+-Multiboard::Multiboard()
++// Native LinkBus multiboard backend: the OS shared memory, IPC mutex and
++// condition variable, and os_RunInstance() partner spawning, moved here from
++// Multiboard without change of behaviour (8412d3d8a multiboard.cpp 344-621).
++class ShmMultiboardBackend : public linkbus::MultiboardBackend
+ {
+-	Instance = this;
+-	sharedMem = nullptr;
++public:
++	explicit ShmMultiboardBackend(int boardId)
++		: id(boardId)
++	{
++		sharedMem = nullptr;
++#ifdef _WIN32
++		const char *FileName = "Local\\naomi_multiboard_mem";
++		if (isMaster())
++			mapFile = CreateFileMapping(
++					INVALID_HANDLE_VALUE,    // use paging file
++					NULL,                    // default security
++					PAGE_READWRITE,          // read/write access
++					0,                       // max. object size (high-order)
++					sizeof(SharedMemory),    // max. object size (low-order)
++					FileName);               // name of mapping object
++		else
++			mapFile = OpenFileMapping(
++				FILE_MAP_ALL_ACCESS,   // read/write access
++				FALSE,                 // do not inherit the name
++				FileName);             // name of mapping object
++
++		if (mapFile == NULL)
++		{
++			ERROR_LOG(NAOMI, "Could not open/create file mapping (%d)", GetLastError());
++		}
++		else
++		{
++			INFO_LOG(NAOMI, "Created shared memory: \"%s\"", FileName);
++			sharedMem = (SharedMemory *) MapViewOfFile(mapFile,   // handle to map object
++					FILE_MAP_ALL_ACCESS, // read/write permission
++					0,
++					0,
++					sizeof(SharedMemory));
++
++			if (sharedMem == nullptr)
++			{
++				ERROR_LOG(NAOMI, "Could not map view of file (%d)", GetLastError());
++				CloseHandle(mapFile);
++				mapFile = NULL;
++			}
++		}
++#else
+ 
+-	boardId = config::loadInt("naomi", "BoardId");
++		sharedMemFileName = "/naomi_multiboard_mem" + std::to_string(isMaster() ? getpid() : getppid());
++		int fd = shm_open(sharedMemFileName.c_str(), O_RDWR | (isMaster() ? O_CREAT : 0), 0644);
++		if (fd < 0)
++			ERROR_LOG(NAOMI, "Can't open mapped file %s: errno %d", sharedMemFileName.c_str(), errno);
++		else
++		{
++			if (isMaster() && ftruncate(fd, sizeof(SharedMemory)))
++				ERROR_LOG(NAOMI, "Can't ftruncate mapped file. errno %d", errno);
++			sharedMem = (SharedMemory *)mmap(nullptr, sizeof(SharedMemory), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++			close(fd);
++		}
++#endif
++		if (sharedMem == nullptr)
++			throw FlycastException("Cannot initialize Naomi multiboard shared memory");
++		if (isMaster())
++		{
++			new (sharedMem) SharedMemory();
++			sharedMem->boardReady[1] = sharedMem->boardReady[2] = sharedMem->boardReady[3] = true;
++			sharedMem->boardSynced[1] = sharedMem->boardSynced[2] = sharedMem->boardSynced[3] = true;
++		}
++		keyboard = std::make_unique<MultiKeyboard>(sharedMem->keyboardEvents);
++	}
++
++	~ShmMultiboardBackend() override
++	{
++		if (sharedMem != nullptr)
++		{
++			sharedMem->exit = true;
++			sharedMem->cond.notify_all();
++			if (isMaster())
++				sharedMem->~SharedMemory();
++		}
+ #ifdef _WIN32
+-	const char *FileName = "Local\\naomi_multiboard_mem";
+-	if (isMaster())
+-		mapFile = CreateFileMapping(
+-				INVALID_HANDLE_VALUE,    // use paging file
+-				NULL,                    // default security
+-				PAGE_READWRITE,          // read/write access
+-				0,                       // max. object size (high-order)
+-				sizeof(SharedMemory),    // max. object size (low-order)
+-				FileName);               // name of mapping object
+-	else
+-		mapFile = OpenFileMapping(
+-			FILE_MAP_ALL_ACCESS,   // read/write access
+-			FALSE,                 // do not inherit the name
+-			FileName);             // name of mapping object
++		if (sharedMem != nullptr)
++			UnmapViewOfFile(sharedMem);
++		if (mapFile != NULL)
++			CloseHandle(mapFile);
++#else
++		if (sharedMem != nullptr)
++			munmap(sharedMem, sizeof(SharedMemory));
++		shm_unlink(sharedMemFileName.c_str());
++#endif
++	}
++
++	int boardId() const override { return id; }
+ 
+-	if (mapFile == NULL)
++	u16 status() const override { return sharedMem->status; }
++	void setStatus(u16 v) override { sharedMem->status = v; }
++	void statusOr(u16 bits) override { sharedMem->status.fetch_or(bits); }
++	void statusAnd(u16 bits) override { sharedMem->status.fetch_and(bits); }
++
++	// Unmasked, exactly like the native sharedMem->data[] accesses; callers
++	// keep the native masking.
++	u16 read16(u32 i) const override { return sharedMem->data[i]; }
++	void write16(u32 i, u16 v) override { sharedMem->data[i] = v; }
++	u32 read32(u32 i) const override { return *(u32 *)&sharedMem->data[i]; }
++	void write32(u32 i, u32 v) override { *(u32 *)&sharedMem->data[i] = v; }
++	void copyOut(u32 i, void *dst, u32 bytes) const override { memcpy(dst, &sharedMem->data[i], bytes); }
++	const u16 *directData() const override { return sharedMem->data; }
++
++	linkbus::BarrierResult barrier(u32 timeoutMs) override
+ 	{
+-		ERROR_LOG(NAOMI, "Could not open/create file mapping (%d)", GetLastError());
++		{
++			std::unique_lock<IpcMutex> lock(sharedMem->mutex);
++			sharedMem->boardReady[id] = true;
++			sharedMem->boardSynced[id] = false;
++			sharedMem->cond.notify_all();
++		}
++		do {
++			if (isSlave() && sharedMem->exit)
++				return linkbus::BarrierResult::Exit;
++			{
++				std::unique_lock<IpcMutex> lock(sharedMem->mutex);
++				bool allReady = true;
++				for (const auto& ready : sharedMem->boardReady)
++					if (!ready) {
++						allReady = false;
++						break;
++					}
++				if (allReady) {
++					sharedMem->boardSynced[id] = true;
++					sharedMem->cond.notify_all();
++					break;
++				}
++				if (sharedMem->cond.wait_for(lock, std::chrono::milliseconds(timeoutMs)) ==  std::cv_status::timeout) {
++					ERROR_LOG(NAOMI, "Time out waiting for multiboard vsync. Slave %d", isSlave());
++					return linkbus::BarrierResult::Timeout;
++				}
++			}
++		} while (true);
++		if (isMaster())
++		{
++			do {
++				{
++					std::unique_lock<IpcMutex> lock(sharedMem->mutex);
++
++					bool allSynced = true;
++					for (const auto& synced : sharedMem->boardSynced)
++						if (!synced) {
++							allSynced = false;
++							break;
++						}
++					if (allSynced)
++					{
++						for (int i = 0; i < boardCount; i++)
++							sharedMem->boardReady[i] = false;
++						break;
++					}
++					if (sharedMem->cond.wait_for(lock, std::chrono::milliseconds(timeoutMs)) ==  std::cv_status::timeout) {
++						ERROR_LOG(NAOMI, "Time out waiting for multiboard vsync");
++						break;
++					}
++				}
++			} while (true);
++		}
++		return linkbus::BarrierResult::Ok;
+ 	}
+-	else
++
++	void requestExit() override
+ 	{
+-		INFO_LOG(NAOMI, "Created shared memory: \"%s\"", FileName);
+-		sharedMem = (SharedMemory *) MapViewOfFile(mapFile,   // handle to map object
+-				FILE_MAP_ALL_ACCESS, // read/write permission
+-				0,
+-				0,
+-				sizeof(SharedMemory));
++		if (sharedMem != nullptr)
++		{
++			sharedMem->exit = true;
++			sharedMem->cond.notify_all();
++		}
++	}
+ 
+-		if (sharedMem == nullptr)
++	void startPartners(int slaves) override
++	{
++		boardCount = slaves + 1;
++		for (int i = 0; i < boardCount; i++)
++			sharedMem->boardReady[i] = false;
++
++		bool derby = settings.content.gameId.substr(0, 6) == " DERBY";
++		int x = config::loadInt("window", "left", (1920 - 640) / 2);
++		int y = config::loadInt("window", "top", (1080 - 480) / 2);
++		int width = config::loadInt("window", "width", 640);
++		std::string romPath;
++		if (derby)
++			// DOC slaves have the same cart as master
++			romPath = settings.content.path;
++		else
++			romPath = CurrentCartridge->game->bios == nullptr ? "naomi" : CurrentCartridge->game->bios;
++
++		for (int i = 0; i < slaves; i++)
+ 		{
+-			ERROR_LOG(NAOMI, "Could not map view of file (%d)", GetLastError());
+-			CloseHandle(mapFile);
+-			mapFile = NULL;
++			std::string region = "config:Dreamcast.Region=" + std::to_string(config::Region);
++			std::string board = "naomi:BoardId=" + std::to_string(i + 1);
++			int slaveX = x;
++			const char *location = "";
++			if (derby) {
++				slaveX = x + width;
++				location = T("Right");
++			}
++			else if (slaves == 2)
++			{
++				if (i == 0) {
++					slaveX = x - width;
++					location = T("Left");
++				}
++				else {
++					slaveX = x + width;
++					location = T("Right");
++				}
++			}
++			else if (slaves == 3)
++			{
++				switch (i)
++				{
++				case 0:
++					slaveX = x;
++					location = T("Center");
++					break;
++				case 1:
++					slaveX = x - width;
++					location = T("Left");
++					break;
++				case 2:
++					slaveX = x + width;
++					location = T("Right");
++					break;
++				}
++			}
++			std::string left = "window:left=" + std::to_string(slaveX);
++			std::string top = "window:top=" + std::to_string(y);
++			std::string title = "window:title=\"" + std::string(location) + " - " + settings.content.title + '"';
++			std::string gameId = "naomi:gameId=\"" + settings.content.gameId + "-SLAVE\"";
++			const char *args[] = {
++				"-config", board.c_str(),
++				"-config", region.c_str(),
++				"-config", left.c_str(),
++				"-config", top.c_str(),
++				"-config", gameId.c_str(),
++				"-config", title.c_str(),
++				romPath.c_str()
++			};
++			os_RunInstance(std::size(args), args);
+ 		}
+ 	}
+-#else
+ 
+-	sharedMemFileName = "/naomi_multiboard_mem" + std::to_string(isMaster() ? getpid() : getppid());
+-	int fd = shm_open(sharedMemFileName.c_str(), O_RDWR | (isMaster() ? O_CREAT : 0), 0644);
+-	if (fd < 0)
+-		ERROR_LOG(NAOMI, "Can't open mapped file %s: errno %d", sharedMemFileName.c_str(), errno);
+-	else
++	void sendKeyboard(u16 code, bool pressed) override
++	{
++		if (keyboard != nullptr)
++			keyboard->write(std::make_pair(code, pressed));
++	}
++
++	bool pollKeyboard(u16 *code, bool *pressed) override
+ 	{
+-		if (isMaster() && ftruncate(fd, sizeof(SharedMemory)))
+-			ERROR_LOG(NAOMI, "Can't ftruncate mapped file. errno %d", errno);
+-		sharedMem = (SharedMemory *)mmap(nullptr, sizeof(SharedMemory), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+-		close(fd);
++		if (keyboard == nullptr || !keyboard->available())
++			return false;
++		auto pair = keyboard->read();
++		*code = pair.first;
++		*pressed = pair.second;
++		return true;
+ 	}
++
++private:
++	bool isMaster() const { return id == 0; }
++	bool isSlave() const { return id != 0; }
++
++	int id;
++	SharedMemory *sharedMem;
++#ifdef _WIN32
++	HANDLE mapFile;
++#else
++	std::string sharedMemFileName;
+ #endif
+-	if (sharedMem == nullptr)
+-		throw FlycastException("Cannot initialize Naomi multiboard shared memory");
+-	if (isMaster())
++	int boardCount = 0;
++	std::unique_ptr<MultiKeyboard> keyboard;
++};
++#endif // !__EMSCRIPTEN__
++
++Multiboard *Multiboard::Instance;
++
++Multiboard::Multiboard()
++{
++	Instance = this;
++
++	boardId = config::loadInt("naomi", "BoardId");
++	const linkbus::MultiboardFactory& factory = linkbus::multiboardFactory();
++	if (factory)
++	{
++		backend = factory(boardId);
++		if (backend == nullptr)
++			throw FlycastException("Cannot initialize Naomi multiboard LinkBus backend");
++	}
++	else
+ 	{
+-		new (sharedMem) SharedMemory();
+-		sharedMem->boardReady[1] = sharedMem->boardReady[2] = sharedMem->boardReady[3] = true;
+-		sharedMem->boardSynced[1] = sharedMem->boardSynced[2] = sharedMem->boardSynced[3] = true;
++#ifndef __EMSCRIPTEN__
++		backend = std::make_unique<ShmMultiboardBackend>(boardId);
++#else
++		throw FlycastException("Naomi multiboard needs a LinkBus backend");
++#endif
+ 	}
+ 	if (settings.content.gameId.substr(0, 4) == "F355")
+ 		syncCycles = BaseSyncCycles / 2;
+@@ -411,7 +653,6 @@ Multiboard::Multiboard()
+ 		syncCycles = BaseSyncCycles;
+ 	schedId = sh4_sched_register(0, schedCallback, this);
+ 	sh4_sched_request(schedId, syncCycles);
+-	keyboard = std::make_unique<MultiKeyboard>(sharedMem->keyboardEvents);
+ }
+ 
+ int Multiboard::schedCallback(int tag, int cycles, int jitter, void *arg)
+@@ -431,74 +672,7 @@ void Multiboard::startSlave()
+ 	else
+ 		slaves = 1;
+ 	boardCount = slaves + 1;
+-	for (int i = 0; i < boardCount; i++)
+-		sharedMem->boardReady[i] = false;
+-
+-	bool derby = settings.content.gameId.substr(0, 6) == " DERBY";
+-	int x = config::loadInt("window", "left", (1920 - 640) / 2);
+-	int y = config::loadInt("window", "top", (1080 - 480) / 2);
+-	int width = config::loadInt("window", "width", 640);
+-	std::string romPath;
+-	if (derby)
+-		// DOC slaves have the same cart as master
+-		romPath = settings.content.path;
+-	else
+-		romPath = CurrentCartridge->game->bios == nullptr ? "naomi" : CurrentCartridge->game->bios;
+-
+-	for (int i = 0; i < slaves; i++)
+-	{
+-		std::string region = "config:Dreamcast.Region=" + std::to_string(config::Region);
+-		std::string board = "naomi:BoardId=" + std::to_string(i + 1);
+-		int slaveX = x;
+-		const char *location = "";
+-		if (derby) {
+-			slaveX = x + width;
+-			location = T("Right");
+-		}
+-		else if (slaves == 2)
+-		{
+-			if (i == 0) {
+-				slaveX = x - width;
+-				location = T("Left");
+-			}
+-			else {
+-				slaveX = x + width;
+-				location = T("Right");
+-			}
+-		}
+-		else if (slaves == 3)
+-		{
+-			switch (i)
+-			{
+-			case 0:
+-				slaveX = x;
+-				location = T("Center");
+-				break;
+-			case 1:
+-				slaveX = x - width;
+-				location = T("Left");
+-				break;
+-			case 2:
+-				slaveX = x + width;
+-				location = T("Right");
+-				break;
+-			}
+-		}
+-		std::string left = "window:left=" + std::to_string(slaveX);
+-		std::string top = "window:top=" + std::to_string(y);
+-		std::string title = "window:title=\"" + std::string(location) + " - " + settings.content.title + '"';
+-		std::string gameId = "naomi:gameId=\"" + settings.content.gameId + "-SLAVE\"";
+-		const char *args[] = {
+-			"-config", board.c_str(),
+-			"-config", region.c_str(),
+-			"-config", left.c_str(),
+-			"-config", top.c_str(),
+-			"-config", gameId.c_str(),
+-			"-config", title.c_str(),
+-			romPath.c_str()
+-		};
+-		os_RunInstance(std::size(args), args);
+-	}
++	backend->startPartners(slaves);
+ 	slaveStarted = true;
+ }
+ 
+@@ -511,79 +685,37 @@ void Multiboard::syncWait()
+ 		return;
+ 	}
+ 
++	switch (backend->barrier(linkbus::kMbBarrierTimeoutMs))
+ 	{
+-		std::unique_lock<IpcMutex> lock(sharedMem->mutex);
+-		sharedMem->boardReady[boardId] = true;
+-		sharedMem->boardSynced[boardId] = false;
+-		sharedMem->cond.notify_all();
+-	}
+-	do {
+-		if (isSlave() && sharedMem->exit) {
+-			NOTICE_LOG(NAOMI, "Slave exiting");
+-			throw FlycastException("Slave exit");
+-		}
+-		{
+-			std::unique_lock<IpcMutex> lock(sharedMem->mutex);
+-			bool allReady = true;
+-			for (const auto& ready : sharedMem->boardReady)
+-				if (!ready) {
+-					allReady = false;
+-					break;
+-				}
+-			if (allReady) {
+-				sharedMem->boardSynced[boardId] = true;
+-				sharedMem->cond.notify_all();
+-				break;
+-			}
+-			if (sharedMem->cond.wait_for(lock, std::chrono::seconds(5)) ==  std::cv_status::timeout) {
+-				ERROR_LOG(NAOMI, "Time out waiting for multiboard vsync. Slave %d", isSlave());
+-				return;
+-			}
+-		}
+-	} while (true);
++	case linkbus::BarrierResult::Exit:
++		NOTICE_LOG(NAOMI, "Slave exiting");
++		throw FlycastException("Slave exit");
++	case linkbus::BarrierResult::Timeout:
++		return;
++	case linkbus::BarrierResult::Ok:
++		break;
++	}
+ 	if (isMaster())
+ 	{
+-		do {
+-			{
+-				std::unique_lock<IpcMutex> lock(sharedMem->mutex);
+-
+-				bool allSynced = true;
+-				for (const auto& synced : sharedMem->boardSynced)
+-					if (!synced) {
+-						allSynced = false;
+-						break;
+-					}
+-				if (allSynced)
+-				{
+-					for (int i = 0; i < boardCount; i++)
+-						sharedMem->boardReady[i] = false;
+-					break;
+-				}
+-				if (sharedMem->cond.wait_for(lock, std::chrono::seconds(5)) ==  std::cv_status::timeout) {
+-					ERROR_LOG(NAOMI, "Time out waiting for multiboard vsync");
+-					break;
+-				}
+-			}
+-		} while (true);
+ 		// Receive keyboard events and pipe them back to SDL. Must be done on the main/ui thread
+-		if (keyboard != nullptr)
++		u16 code;
++		bool pressed;
++		while (backend->pollKeyboard(&code, &pressed))
+ 		{
+-			while (keyboard->available())
+-			{
+-				auto pair = keyboard->read();
+-				if (!pair.second)
+-					// Ignore key up events: we always send them in pair
+-					continue;
+-				gui_runOnUiThread([pair]() {
+-					sdlReceiveSlaveKeyboardEvent(pair.first, true);
+-					sdlReceiveSlaveKeyboardEvent(pair.first, false);
+-				});
+-			}
++			if (!pressed)
++				// Ignore key up events: we always send them in pair
++				continue;
++#ifndef __EMSCRIPTEN__
++			gui_runOnUiThread([code]() {
++				sdlReceiveSlaveKeyboardEvent(code, true);
++				sdlReceiveSlaveKeyboardEvent(code, false);
++			});
++#endif
+ 		}
+ 	}
+ 	else
+ 	{
+-		const u16 newStatus = sharedMem->status;
++		const u16 newStatus = backend->status();
+ 		if ((newStatus ^ g2status) & 1) {
+ 			// Bank switch
+ 			if ((1 << boardId) & newStatus) {
+@@ -601,23 +733,9 @@ Multiboard::~Multiboard()
+ 	if (schedId != -1)
+ 		sh4_sched_unregister(schedId);
+ 
+-	if (sharedMem != nullptr)
+-	{
+-		sharedMem->exit = true;
+-		sharedMem->cond.notify_all();
+-		if (isMaster())
+-			sharedMem->~SharedMemory();
+-	}
+-#ifdef _WIN32
+-	if (sharedMem != nullptr)
+-		UnmapViewOfFile(sharedMem);
+-	if (mapFile != NULL)
+-		CloseHandle(mapFile);
+-#else
+-	if (sharedMem != nullptr)
+-		munmap(sharedMem, sizeof(SharedMemory));
+-	shm_unlink(sharedMemFileName.c_str());
+-#endif
++	if (backend != nullptr)
++		backend->requestExit();
++	backend.reset();
+ }
+ 
+ std::pair<u32, bool> Multiboard::readG1(u32 addr, u32 size)
+@@ -629,7 +747,7 @@ std::pair<u32, bool> Multiboard::readG1(u32 addr, u32 size)
+ 
+ 	case NAOMI_MBOARD_DATA_addr:
+ 		{
+-			u32 bank = (sharedMem->status & 1) ? 0 : 0x80000;
++			u32 bank = (backend->status() & 1) ? 0 : 0x80000;
+ 			u32 addr;
+ 			if (isMaster())
+ 			{
+@@ -640,7 +758,7 @@ std::pair<u32, bool> Multiboard::readG1(u32 addr, u32 size)
+ 			{
+ 				addr = (offset & 0xffff) + (boardId - 1) * 0x10000 + bank / 2;
+ 			}
+-			u16 data = sharedMem->data[addr & (MEM_SIZE - 1)];
++			u16 data = backend->read16(addr & (MEM_SIZE - 1));
+ 			//DEBUG_LOG(NAOMI, "[%d] read MBOARD_DATA[%x]: %x (pc = %x)", boardId, addr, data, p_sh4rcb->cntx.pc);
+ 			offset++;
+ 			return std::make_pair(data, true);
+@@ -688,7 +806,7 @@ bool Multiboard::writeG1(u32 addr, u32 data, u32 size)
+ 	case NAOMI_MBOARD_DATA_addr:
+ 		{
+ 			DEBUG_LOG(NAOMI, "[%d] MBOARD_DATA[%x] = %x (pc = %x)", boardId, offset, data, p_sh4rcb->cntx.pc);
+-			u32 bank = (sharedMem->status & 1) ? 0 : 0x80000;
++			u32 bank = (backend->status() & 1) ? 0 : 0x80000;
+ 			u32 addr;
+ 			if (isMaster())
+ 			{
+@@ -699,7 +817,7 @@ bool Multiboard::writeG1(u32 addr, u32 data, u32 size)
+ 			{
+ 				addr = (offset & 0xffff) + (boardId - 1) * 0x10000 + bank / 2;
+ 			}
+-			sharedMem->data[addr & (MEM_SIZE - 1)] = data;
++			backend->write16(addr & (MEM_SIZE - 1), data);
+ 			offset++;
+ 		}
+ 		return true;
+@@ -725,7 +843,7 @@ bool Multiboard::writeG1(u32 addr, u32 data, u32 size)
+ 				asic_CancelInterrupt(holly_GDROM_CMD);
+ 				break;
+ 			case 4: // board ready
+-				sharedMem->status.fetch_or(0x10 << boardId);
++				backend->statusOr(0x10 << boardId);
+ 				break;
+ 			default:
+ 				break;
+@@ -765,7 +883,7 @@ u32 Multiboard::readG2Ext(u32 addr, u32 size)
+ 			// seems to determine if acting as master or slave
+ 			if (isSlave())
+ 				return 0;
+-			u16 v = 0xff00 | sharedMem->status;
++			u16 v = 0xff00 | backend->status();
+ 			//DEBUG_LOG(NAOMI, "[%d] g2ext_readMem status_reg %x", boardId, v);
+ 			return v;
+ 		}
+@@ -773,17 +891,17 @@ u32 Multiboard::readG2Ext(u32 addr, u32 size)
+ 	default:
+ 		if ((addr - 0x1020000) < MEM_SIZE * 2 && isMaster())
+ 		{
+-			u32 bank = (sharedMem->status & 1) ? 0x80000 : 0;
++			u32 bank = (backend->status() & 1) ? 0x80000 : 0;
+ 			verify(size >= 2);
+ 			u32 offset = (addr - 0x1020000 + bank) / 2;
+ 
+ 			if (size == 2) {
+-				DEBUG_LOG(NAOMI, "[%d] g2ext_readMem<%d> %x -> %x", boardId, size, addr, sharedMem->data[offset]);
+-				return sharedMem->data[offset];
++				DEBUG_LOG(NAOMI, "[%d] g2ext_readMem<%d> %x -> %x", boardId, size, addr, backend->read16(offset));
++				return backend->read16(offset);
+ 			}
+ 			else {
+-				DEBUG_LOG(NAOMI, "[%d] g2ext_readMem<%d> %x -> %x", boardId, size, addr, *(u32 *)&sharedMem->data[offset]);
+-				return *(u32 *)&sharedMem->data[offset];
++				DEBUG_LOG(NAOMI, "[%d] g2ext_readMem<%d> %x -> %x", boardId, size, addr, backend->read32(offset));
++				return backend->read32(offset);
+ 			}
+ 		}
+ 		break;
+@@ -801,7 +919,7 @@ void Multiboard::writeG2Ext(u32 addr, u32 data, u32 size)
+ 		DEBUG_LOG(NAOMI, "[%d] G2_STATUS write %x", boardId, data);
+ 		if (isMaster()) {
+ 			verify(size == 2);
+-			sharedMem->status = data;
++			backend->setStatus((u16)data);
+ 		}
+ 		break;
+ 
+@@ -814,35 +932,36 @@ void Multiboard::writeG2Ext(u32 addr, u32 data, u32 size)
+ 		{
+ 			DEBUG_LOG(NAOMI, "[%d] g2ext_writeMem<%d> %x: %x pc %x pr %x", boardId, size, addr, data, p_sh4rcb->cntx.pc, p_sh4rcb->cntx.pr);
+ 			verify(size >= 2);
+-			u32 bank = (sharedMem->status & 1) ? 0x80000 : 0;
++			const u16 status = backend->status();
++			u32 bank = (status & 1) ? 0x80000 : 0;
+ 			u32 offset = (addr - 0x1020000 + bank) / 2;
+-			if ((sharedMem->status & 2) != 0 || addr >= 0x1040000)
++			if ((status & 2) != 0 || addr >= 0x1040000)
+ 			{
+ 				int slot = (addr - 0x1020000) / 0x20000 + 1;
+ 				// Only connected boards have a writable shared memory area
+ 				if (slot < boardCount)
+ 				{
+ 					if (size == 2)
+-						sharedMem->data[offset] = data;
++						backend->write16(offset, data);
+ 					else
+-						*(u32 *)&sharedMem->data[offset] = data;
++						backend->write32(offset, data);
+ 				}
+ 			}
+ 			if (addr < 0x1040000)
+ 			{
+-				if ((sharedMem->status & 4) != 0 && boardCount >= 3)
++				if ((status & 4) != 0 && boardCount >= 3)
+ 				{
+ 					if (size == 2)
+-						sharedMem->data[offset + 0x10000] = data;
++						backend->write16(offset + 0x10000, data);
+ 					else
+-						*(u32 *)&sharedMem->data[offset + 0x10000] = data;
++						backend->write32(offset + 0x10000, data);
+ 				}
+-				if ((sharedMem->status & 8) != 0 && boardCount >= 4)
++				if ((status & 8) != 0 && boardCount >= 4)
+ 				{
+ 					if (size == 2)
+-						sharedMem->data[offset + 0x20000] = data;
++						backend->write16(offset + 0x20000, data);
+ 					else
+-						*(u32 *)&sharedMem->data[offset + 0x20000] = data;
++						backend->write32(offset + 0x20000, data);
+ 				}
+ 			}
+ 		}
+@@ -859,10 +978,19 @@ bool Multiboard::dmaStart()
+ 	verify(1 == SB_GDDIR);
+ 	u32 start = SB_GDSTAR & 0x1FFFFFE0;
+ 	u32 len = (SB_GDLEN + 31) & ~31;
+-	u32 bank = (sharedMem->status & 1) ? 0 : 0x80000;
+-	u32 *src = (u32 *)&sharedMem->data[(boardId - 1) * 0x10000 + bank / 2 + dmaOffset];
+-
+-	WriteMemBlock_nommu_ptr(start, src, len);
++	u32 bank = (backend->status() & 1) ? 0 : 0x80000;
++	const u32 srcWord = (boardId - 1) * 0x10000 + bank / 2 + dmaOffset;
++	if (const u16 *data = backend->directData())
++	{
++		u32 *src = (u32 *)&data[srcWord];
++		WriteMemBlock_nommu_ptr(start, src, len);
++	}
++	else
++	{
++		std::vector<u32> buf(len / 4);
++		backend->copyOut(srcWord, buf.data(), len);
++		WriteMemBlock_nommu_ptr(start, buf.data(), len);
++	}
+ 	SB_GDSTARD = start + len;
+ 	SB_GDLEND = len;
+ 
+@@ -872,12 +1000,12 @@ bool Multiboard::dmaStart()
+ void Multiboard::reset()
+ {
+ 	if (isSlave())
+-		sharedMem->status.fetch_and(~(0x10 << boardId));
++		backend->statusAnd((u16)~(0x10 << boardId));
+ }
+ 
+ void Multiboard::keyboardEvent(u16 code, bool pressed) {
+-	if (Instance != nullptr && Instance->keyboard != nullptr)
+-		Instance->keyboard->write(std::make_pair(code, pressed));
++	if (Instance != nullptr && Instance->backend != nullptr)
++		Instance->backend->sendKeyboard(code, pressed);
+ }
+ 
+ #endif // NAOMI_MULTIBOARD
+diff --git a/core/hw/naomi/multiboard.h b/core/hw/naomi/multiboard.h
+index 5c3b3d6dd..ddf92ecb0 100644
+--- a/core/hw/naomi/multiboard.h
++++ b/core/hw/naomi/multiboard.h
+@@ -26,8 +26,7 @@
+ #include <windows.h>
+ #endif
+ 
+-struct SharedMemory;
+-struct MultiKeyboard;
++namespace linkbus { class MultiboardBackend; }
+ 
+ class Multiboard
+ {
+@@ -55,19 +54,15 @@ private:
+ 	int boardId = 0;
+ 	u32 offset = 0;
+ 	u32 reg9c = 0;
+-	SharedMemory *sharedMem;
+-#ifdef _WIN32
+-	HANDLE mapFile;
+-#else
+-	std::string sharedMemFileName;
+-#endif
++	// LinkBus (PLAN_V2 2.10): shared bank, status and barrier. Native default
++	// is the OS shared memory backend in multiboard.cpp.
++	std::unique_ptr<linkbus::MultiboardBackend> backend;
+ 	int boardCount = 0;
+ 	bool slaveStarted = false;
+ 	int schedId;
+ 	int syncCycles;
+ 	u16 g2status = 0;
+ 	u16 dmaOffset = 0;
+-	std::unique_ptr<struct MultiKeyboard> keyboard;
+ 	static Multiboard *Instance;
+ };
+ 
+diff --git a/core/hw/naomi/naomi_cart.cpp b/core/hw/naomi/naomi_cart.cpp
+index 85fda8330..f1339a959 100644
+--- a/core/hw/naomi/naomi_cart.cpp
++++ b/core/hw/naomi/naomi_cart.cpp
+@@ -720,7 +720,7 @@ void naomi_cart_LoadRom(const std::string& path, const std::string& fileName, Lo
+ 		}
+ 		Naomi_setDmaDelay();
+ 
+-#ifdef NAOMI_MULTIBOARD
++#if defined(NAOMI_MULTIBOARD) && !defined(__EMSCRIPTEN__)
+ 		// Not a multiboard game but needs the same desktop environment
+ 		if (gameId == "SEGA DRIVING SIMULATOR")
+ 		{
+diff --git a/tests/linkbus/.gitattributes b/tests/linkbus/.gitattributes
+new file mode 100644
+index 000000000..dfdb8b771
+--- /dev/null
++++ b/tests/linkbus/.gitattributes
+@@ -0,0 +1 @@
++*.sh text eol=lf
+-- 
+2.56.0.windows.3
+

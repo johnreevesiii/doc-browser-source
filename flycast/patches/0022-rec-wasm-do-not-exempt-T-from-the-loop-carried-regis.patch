@@ -1,0 +1,125 @@
+From e2e54ca6cc5eb4091404c13212520c0055e02205 Mon Sep 17 00:00:00 2001
+From: John R Reeves III <johnreevesiii@outlook.com>
+Date: Mon, 2 Nov 2026 09:12:53 -0800
+Subject: [PATCH 22/22] rec-wasm: do not exempt T from the loop-carried
+ register test
+
+fly_block_idle_ff dropped T from the carried set unconditionally. A
+pass that reads T before writing it carries state, for example
+L: mov.l @r4,r0; movt r1; tst r1,r1; bt/s L; tst r1,r1, where the
+delay slot sets the T that the next pass's movt reads. T is now
+treated like every other register, and a delayed conditional branch
+whose delay slot writes T is refused outright.
+
+fly_jit_selftest gains that loop as case t-carried (expected not to
+qualify). Idle-predicate failures now use bits 0 to 15 of the mask and
+the ifb checks move to bits 16 to 20.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MGX7KQ5gfrWApgW64pZbQ5
+---
+ core/rec-wasm/rec_wasm.cpp | 47 +++++++++++++++++++++++++-------------
+ 1 file changed, 31 insertions(+), 16 deletions(-)
+
+diff --git a/core/rec-wasm/rec_wasm.cpp b/core/rec-wasm/rec_wasm.cpp
+index 1dc473dc4..d6a3f9131 100644
+--- a/core/rec-wasm/rec_wasm.cpp
++++ b/core/rec-wasm/rec_wasm.cpp
+@@ -1615,7 +1615,8 @@ static void applyBlockExitCpp(RuntimeBlockInfo* block) {
+ //  - it has no interpreter-fallback op and no op with hidden state (div1
+ //    keeps Q and M, sync_sr and sync_fpscr and frswap switch banks);
+ //  - it carries no register state between passes: every register it writes,
+-//    other than T, is written before any read in the block. A dt counter, an
++//    T included, is written before any read in the block, and a delayed
++//    branch's delay slot does not write T. A dt counter, an
+ //    add #1 calibration counter or a pointer walk is loop-carried, so a poll
+ //    with a timeout (L: mov.l @r4,r0; tst #1,r0; bf/s L; dt r5) or a
+ //    calibration loop (L: add #1,r1; mov.l @r2,r0; tst #1,r0; bt L) is a
+@@ -1688,9 +1689,20 @@ static bool fly_block_idle_ff(const RuntimeBlockInfo* block)
+ 				return false;
+ 		}
+ 	}
+-	// T is the loop condition itself; it is recomputed every pass.
+-	u64 tbit = 1ull << (reg_sr_T & 63);
+-	carried[reg_sr_T >> 6] &= ~tbit;
++	// T gets no exemption: a pass that reads T before writing it (movt, addc,
++	// rotcl, a delayed branch's jcond) carries T from the previous pass.
++	// A delayed conditional branch whose delay slot writes T is refused
++	// outright: the branch tests the old T, the slot sets the next pass's T.
++	if (block->has_jcond)
++		for (const shil_opcode& op : block->oplist) {
++			if (!op.delay_slot)
++				continue;
++			u64 w[2] = { 0, 0 };
++			fly_idle_reg_mark(w, op.rd);
++			fly_idle_reg_mark(w, op.rd2);
++			if (w[reg_sr_T >> 6] & (1ull << (reg_sr_T & 63)))
++				return false;
++		}
+ 	if ((carried[0] & written[0]) || (carried[1] & written[1]))
+ 		return false;
+ 	return bcls == BET_CLS_Static || reads;
+@@ -1717,14 +1729,15 @@ static inline void fly_bridge_idle_ff(const RuntimeBlockInfo* block)
+ // its page generation so any cached block there re-verifies. Do not call it
+ // in a run whose hashes matter. Returns a failure mask (0 = all pass) and
+ // prints one line per check.
+-//  bits 0..7: fly_block_idle_ff on decoded SH4 loops (expected value below)
+-//  bit 8: an ifb store (or.b #imm,@(R0,GBR)) through wasm_exec_ifb did not
++//  bits 0..15: fly_block_idle_ff on decoded SH4 loops (case index; the
++//         expected value is in the table below)
++//  bit 16: an ifb store (or.b #imm,@(R0,GBR)) through wasm_exec_ifb did not
+ //         bump g_fly_page_gen for the written page
+-//  bit 9: the ifb store did not reach RAM (test setup broken)
+-//  bit 10: WriteMem* pointers were not restored after the ifb op
+-//  bit 11: control: the same store through OpPtr without the guard DID bump
+-//          (would make bit 8 meaningless)
+-//  bit 12: a test block failed to decode
++//  bit 17: the ifb store did not reach RAM (test setup broken)
++//  bit 18: WriteMem* pointers were not restored after the ifb op
++//  bit 19: control: the same store through OpPtr without the guard DID bump
++//          (would make bit 16 meaningless)
++//  bit 20: a test block failed to decode
+ extern "C" u32 EMSCRIPTEN_KEEPALIVE fly_jit_selftest()
+ {
+ 	Sh4Context& ctx = Sh4cntx;
+@@ -1752,6 +1765,8 @@ extern "C" u32 EMSCRIPTEN_KEEPALIVE fly_jit_selftest()
+ 		{ "poll-store", { 0x6042, 0x2602, 0xC801, 0x89FB, 0x0009 }, 5, false },
+ 		// L: add #1,r1; bra L; nop   static counter, no memory
+ 		{ "static-count", { 0x7101, 0xAFFD, 0x0009 }, 3, false },
++		// L: mov.l @r4,r0; movt r1; tst r1,r1; bt/s L; tst r1,r1   T carried
++		{ "t-carried", { 0x6042, 0x0129, 0x2118, 0x8DFB, 0x2118, 0x0009 }, 6, false },
+ 	};
+ 	for (u32 ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ci++) {
+ 		const Case& c = cases[ci];
+@@ -1761,7 +1776,7 @@ extern "C" u32 EMSCRIPTEN_KEEPALIVE fly_jit_selftest()
+ 		bool ok = blk->Setup(base, ctx.fpscr);
+ 		bool got = ok && fly_block_idle_ff(blk);
+ 		if (!ok)
+-			fails |= 1u << 12;
++			fails |= 1u << 20;
+ 		if (!ok || got != c.expect)
+ 			fails |= 1u << ci;
+ 		printf("[selftest] idle_ff %-13s ops=%u type=%u expect=%d got=%d %s\n",
+@@ -1785,15 +1800,15 @@ extern "C" u32 EMSCRIPTEN_KEEPALIVE fly_jit_selftest()
+ 		bool bumped = g1 != g0;
+ 		bool stored = mem_b[off + 0x10] == 0x5A;
+ 		bool restored = WriteMem8 == w8 && WriteMem16 == w16 && WriteMem32 == w32 && WriteMem64 == w64;
+-		if (!bumped) fails |= 1u << 8;
+-		if (!stored) fails |= 1u << 9;
+-		if (!restored) fails |= 1u << 10;
++		if (!bumped) fails |= 1u << 16;
++		if (!stored) fails |= 1u << 17;
++		if (!restored) fails |= 1u << 18;
+ 		// Control: the bare interpreter handler (no guard) must not bump.
+ 		mem_b[off + 0x10] = 0x00;
+ 		u32 g2 = g_fly_page_gen[page];
+ 		OpPtr[0xCF5A](&ctx, 0xCF5A);
+ 		bool ctrl_bumped = g_fly_page_gen[page] != g2;
+-		if (ctrl_bumped) fails |= 1u << 11;
++		if (ctrl_bumped) fails |= 1u << 19;
+ 		printf("[selftest] ifb or.b gen %u->%u stored=%d restored=%d control_bump=%d %s\n",
+ 			g0, g1, stored, restored, ctrl_bumped,
+ 			(bumped && stored && restored && !ctrl_bumped) ? "PASS" : "FAIL");
+-- 
+2.56.0.windows.3
+

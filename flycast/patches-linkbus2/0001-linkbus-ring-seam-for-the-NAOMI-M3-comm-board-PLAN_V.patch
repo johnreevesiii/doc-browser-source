@@ -1,0 +1,2794 @@
+From 9e52fa7bf92ee9eea61a17de7912d815fa6f452f Mon Sep 17 00:00:00 2001
+From: John R Reeves III <johnreevesiii@outlook.com>
+Date: Mon, 2 Nov 2026 06:58:33 -0800
+Subject: [PATCH 1/9] linkbus: ring seam for the NAOMI M3 comm board (PLAN_V2
+ 2.10, D-061)
+
+NaomiM3Comm now reaches the ring through linkbus::RingBackend instead of
+calling NaomiNetwork directly. With no backend installed it uses the UDP
+backend, which wraps naomiNetwork and keeps the 8412d3d8a behaviour: take
+with a 100 ms poll, "No data received" log, zero-filled whole-region copy,
+transcnt from the predecessor's packet number, send after take, and any
+FlycastException zeroing comm_status1/2.
+
+Also added:
+- InMemoryHub: star hub for all seats in one process with an equal delay L,
+  using the same wire format and checks as remote seats (tests, and the
+  reference for the TypeScript hub).
+- Mailbox ring backend over a MailboxIo, with a byte-exact buffer reference
+  and an Emscripten JS bridge (SharedArrayBuffer mailbox, postMessage hook).
+  No transport (no WebRTC).
+- Wire checks with edition tag refusal, session tag, slot geometry.
+- FramePacer: one local frame per hub tick for each seat (CLAIM_FAIRNESS
+  R3), with bounded hold, catch-up and backlog.
+- LinkBusHandshake: when the host installed a backend before load, the role
+  is known and SetNaomiNetworkConfig() runs synchronously in init().
+- Standalone unit tests (tests/linkbus), built with emcc and run under node.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MGX7KQ5gfrWApgW64pZbQ5
+---
+ core/hw/naomi/naomi_m3comm.cpp |  75 ++-
+ core/hw/naomi/naomi_m3comm.h   |   2 -
+ core/network/CMakeLists.txt    |   6 +-
+ core/network/linkbus.cpp       | 846 +++++++++++++++++++++++++++++++++
+ core/network/linkbus.h         | 458 ++++++++++++++++++
+ core/network/linkbus_udp.cpp   | 109 +++++
+ core/network/linkbus_web.cpp   | 364 ++++++++++++++
+ core/network/net_handshake.cpp |  32 +-
+ tests/linkbus/linkbus_test.cpp | 706 +++++++++++++++++++++++++++
+ tests/linkbus/run-tests.sh     |  20 +
+ 10 files changed, 2575 insertions(+), 43 deletions(-)
+ create mode 100644 core/network/linkbus.cpp
+ create mode 100644 core/network/linkbus.h
+ create mode 100644 core/network/linkbus_udp.cpp
+ create mode 100644 core/network/linkbus_web.cpp
+ create mode 100644 tests/linkbus/linkbus_test.cpp
+ create mode 100644 tests/linkbus/run-tests.sh
+
+diff --git a/core/hw/naomi/naomi_m3comm.cpp b/core/hw/naomi/naomi_m3comm.cpp
+index 61c66bae8..ce5ff5067 100644
+--- a/core/hw/naomi/naomi_m3comm.cpp
++++ b/core/hw/naomi/naomi_m3comm.cpp
+@@ -28,7 +28,7 @@
+ #include "naomi_regs.h"
+ #include "hw/holly/sb.h"
+ #include "hw/sh4/sh4_mem.h"
+-#include "network/naomi_network.h"
++#include "network/linkbus.h"
+ #include "emulator.h"
+ #include "oslib/oslib.h"
+ #include "oslib/i18n.h"
+@@ -61,6 +61,18 @@ static inline u16 swap16(u16 w)
+ }
+ #endif
+ 
++// LinkBus (PLAN_V2 2.10): the ring transport is a pluggable backend. With no
++// backend installed this is the native NaomiNetwork UDP ring, unchanged.
++static linkbus::RingBackend *ring()
++{
++	if (linkbus::ringBackendInstalled())
++		return linkbus::ringBackend();
++	// Never destroyed, like the naomiNetwork global it wraps: the static
++	// m3comm in naomi.cpp may call closeNetwork() during static destruction.
++	static linkbus::RingBackend *udp = linkbus::makeUdpRingBackend().release();
++	return udp;
++}
++
+ static void vblankCallback(Event event, void *param) {
+ 	((NaomiM3Comm *)param)->vblank();
+ }
+@@ -68,7 +80,7 @@ static void vblankCallback(Event event, void *param) {
+ void NaomiM3Comm::closeNetwork()
+ {
+ 	EventManager::unlisten(Event::VBlank, vblankCallback, this);
+-	naomiNetwork.shutdown();
++	ring()->shutdown();
+ 
+ 	comm_ctrl = 0xC000;
+ 	comm_offset = 0;
+@@ -85,8 +97,9 @@ void NaomiM3Comm::connectNetwork()
+ {
+ 	os_notify(i18n::T("Network started"), 5000);
+ 	packet_number = 0;
+-	slot_count = naomiNetwork.getSlotCount();
+-	slot_id = naomiNetwork.getSlotId();
++	const linkbus::RingRole role = ring()->role();
++	slot_count = role.slotCount;
++	slot_id = role.slotId;
+ 	if (slot_count >= 2)
+ 	{
+ 		connectedState();
+@@ -94,30 +107,6 @@ void NaomiM3Comm::connectNetwork()
+ 	}
+ }
+ 
+-bool NaomiM3Comm::receiveNetwork()
+-{
+-	const u32 slot_size = swap16(*(u16*)&m68k_ram[0x204]);
+-	const u32 packet_size = slot_size * slot_count;
+-
+-	std::unique_ptr<u8[]> buf = std::make_unique<u8[]>(packet_size);
+-
+-	u16 packetNumber;
+-	if (!naomiNetwork.receive(buf.get(), packet_size, &packetNumber))
+-		return false;
+-
+-	*(u16*)&comm_ram[6] = swap16(packetNumber);
+-	memcpy(&comm_ram[0x100 + slot_size], buf.get(), packet_size);
+-
+-	return true;
+-}
+-
+-void NaomiM3Comm::sendNetwork()
+-{
+-	const u32 packet_size = swap16(*(u16*)&m68k_ram[0x204]) * slot_count;
+-	naomiNetwork.send(&comm_ram[0x100], packet_size, packet_number);
+-	packet_number++;
+-}
+-
+ u32 NaomiM3Comm::ReadMem(u32 address, u32 size)
+ {
+ 	switch (address)
+@@ -286,18 +275,26 @@ void NaomiM3Comm::vblank()
+ 	if ((comm_ctrl & COMM_CTRL_RESET) == 0 || comm_status2 == 0)
+ 		return;
+ 
+-	using the_clock = std::chrono::high_resolution_clock;
+-	the_clock::time_point start = the_clock::now();
+-	try {
+-		bool received = false;
+-		do {
+-			received = receiveNetwork();
+-		} while (!received && the_clock::now() - start < std::chrono::milliseconds(100));
+-		if (!received)
+-			INFO_LOG(NETWORK, "No data received");
+-		sendNetwork();
+-	} catch (const FlycastException& e) {
++	// Same order and outcomes as 8412d3d8a: take the newest frame from the
++	// ring predecessor (waiting up to 100 ms on the UDP ring), store its packet
++	// number in transcnt, then send. A link error zeroes the status words.
++	linkbus::RingBackend *backend = ring();
++	const u32 slot_size = swap16(*(u16*)&m68k_ram[0x204]);
++	const linkbus::TakeResult r = backend->take(&comm_ram[linkbus::rxSlotOffset(slot_size, 1)],
++			slot_size, slot_count, backend->defaultWaitMs());
++	if (r.error)
++	{
+ 		comm_status1 = 0;
+ 		comm_status2 = 0;
++		return;
+ 	}
++	if (r.fresh)
++		*(u16*)&comm_ram[6] = swap16(r.packetNumber);
++	if (!backend->publish(&comm_ram[linkbus::kCommTxOffset], slot_size, slot_count, packet_number))
++	{
++		comm_status1 = 0;
++		comm_status2 = 0;
++		return;
++	}
++	packet_number++;
+ }
+diff --git a/core/hw/naomi/naomi_m3comm.h b/core/hw/naomi/naomi_m3comm.h
+index d98f1d944..84864e003 100644
+--- a/core/hw/naomi/naomi_m3comm.h
++++ b/core/hw/naomi/naomi_m3comm.h
+@@ -36,8 +36,6 @@ public:
+ 
+ private:
+ 	void connectNetwork();
+-	bool receiveNetwork();
+-	void sendNetwork();
+ 	void connectedState();
+ 
+ 	u16 comm_ctrl = 0xC000;
+diff --git a/core/network/CMakeLists.txt b/core/network/CMakeLists.txt
+index 2583705a2..8aa95cfaa 100644
+--- a/core/network/CMakeLists.txt
++++ b/core/network/CMakeLists.txt
+@@ -21,4 +21,8 @@ target_sources(${PROJECT_NAME} PRIVATE
+         dcnet.h
+         ice.cpp
+         ice.h
+-        ifaddrs.c)
++        ifaddrs.c
++        linkbus.cpp
++        linkbus.h
++        linkbus_udp.cpp
++        linkbus_web.cpp)
+diff --git a/core/network/linkbus.cpp b/core/network/linkbus.cpp
+new file mode 100644
+index 000000000..778c84aec
+--- /dev/null
++++ b/core/network/linkbus.cpp
+@@ -0,0 +1,846 @@
++/*
++	LinkBus: Flycast-independent parts (globals, wire checks, frame pacer,
++	in-memory hub, mailbox backend, in-memory multiboard cabinet).
++
++	Copyright (C) 2026 John R Reeves III
++	SPDX-License-Identifier: GPL-2.0-or-later
++
++	This program is free software: you can redistribute it and/or modify
++	it under the terms of the GNU General Public License as published by
++	the Free Software Foundation, either version 2 of the License, or
++	(at your option) any later version.
++
++	This program is distributed in the hope that it will be useful,
++	but WITHOUT ANY WARRANTY; without even the implied warranty of
++	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++	GNU General Public License for more details.
++*/
++#include "linkbus.h"
++
++#include <algorithm>
++#include <chrono>
++#include <condition_variable>
++#include <deque>
++#include <mutex>
++#include <vector>
++
++namespace linkbus
++{
++
++// ---------------------------------------------------------------------------
++// Globals
++// ---------------------------------------------------------------------------
++
++// Raw pointer on purpose: no destructor at exit, because NaomiM3Comm can be
++// destroyed during static destruction and still call ringBackend().
++static RingBackend *installedRing;
++static MultiboardFactory installedMultiboardFactory;
++
++RingBackend *ringBackend() {
++	return installedRing;
++}
++
++void setRingBackend(std::unique_ptr<RingBackend> backend) {
++	RingBackend *old = installedRing;
++	installedRing = backend.release();
++	delete old;
++}
++
++bool ringBackendInstalled() {
++	return installedRing != nullptr;
++}
++
++void setMultiboardFactory(MultiboardFactory factory) {
++	installedMultiboardFactory = std::move(factory);
++}
++
++const MultiboardFactory& multiboardFactory() {
++	return installedMultiboardFactory;
++}
++
++// ---------------------------------------------------------------------------
++// Wire checks
++// ---------------------------------------------------------------------------
++
++FrameCheck checkSlotFrame(const u8 *bytes, u32 size, const WireExpect& expect,
++		SlotFrameHeader *out)
++{
++	SlotFrameHeader h;
++	if (bytes == nullptr || size < sizeof(h))
++		return FrameCheck::BadSize;
++	std::memcpy(&h, bytes, sizeof(h));
++	if (h.magic != kSlotMagic || h.version != kWireVersion || h.sessionTag != expect.sessionTag)
++		return FrameCheck::BadHeader;
++	// Edition is checked before geometry: a foreign edition is refused as such.
++	if (h.edition != (u8)expect.edition)
++		return FrameCheck::BadEdition;
++	if (expect.slotCount != 0 && h.slotCount != expect.slotCount)
++		return FrameCheck::BadSize;
++	if (h.slotCount < 2 || h.slotCount > kMaxRingNodes || h.nodeId >= h.slotCount)
++		return FrameCheck::BadHeader;
++	if (h.slotSize == 0 || (expect.slotSize != 0 && h.slotSize != expect.slotSize))
++		return FrameCheck::BadSize;
++	if (size != sizeof(h) + h.slotSize)
++		return FrameCheck::BadSize;
++	if (out != nullptr)
++		*out = h;
++	return FrameCheck::Ok;
++}
++
++FrameCheck checkAssembledFrame(const u8 *bytes, u32 size, const WireExpect& expect,
++		AssembledFrameHeader *out)
++{
++	AssembledFrameHeader h;
++	if (bytes == nullptr || size < sizeof(h))
++		return FrameCheck::BadSize;
++	std::memcpy(&h, bytes, sizeof(h));
++	if (h.magic != kAssembledMagic || h.version != kWireVersion || h.sessionTag != expect.sessionTag)
++		return FrameCheck::BadHeader;
++	if (h.edition != (u8)expect.edition)
++		return FrameCheck::BadEdition;
++	if (expect.targetNode >= 0 && h.targetNode != expect.targetNode)
++		return FrameCheck::BadHeader;
++	if (expect.slotCount != 0 && h.slotCount != expect.slotCount)
++		return FrameCheck::BadSize;
++	if (h.slotSize == 0 || (expect.slotSize != 0 && h.slotSize != expect.slotSize))
++		return FrameCheck::BadSize;
++	const u32 payload = (u32)h.slotSize * h.slotCount;
++	if (payload > kMaxPayload || size != sizeof(h) + payload)
++		return FrameCheck::BadSize;
++	if (out != nullptr)
++		*out = h;
++	return FrameCheck::Ok;
++}
++
++static void countCheck(FrameCheck c, RingBackend::Stats& st)
++{
++	switch (c)
++	{
++	case FrameCheck::BadEdition: st.badEdition++; break;
++	case FrameCheck::BadSize: st.badSize++; break;
++	case FrameCheck::BadHeader: st.badHeader++; break;
++	default: break;
++	}
++}
++
++static std::vector<u8> encodeSlotFrame(const u8 *txBase, u32 slotSize, int nodeId, int slotCount,
++		Edition edition, u16 packetNumber, u32 localFrame, u32 sessionTag)
++{
++	SlotFrameHeader h;
++	h.magic = kSlotMagic;
++	h.version = kWireVersion;
++	h.edition = (u8)edition;
++	h.nodeId = (u8)nodeId;
++	h.slotCount = (u8)slotCount;
++	h.slotSize = (u16)slotSize;
++	h.packetNumber = packetNumber;
++	h.localFrame = localFrame;
++	h.sessionTag = sessionTag;
++	std::vector<u8> frame(sizeof(h) + slotSize);
++	std::memcpy(frame.data(), &h, sizeof(h));
++	std::memcpy(frame.data() + sizeof(h), txBase, slotSize);
++	return frame;
++}
++
++// ---------------------------------------------------------------------------
++// FramePacer
++// ---------------------------------------------------------------------------
++
++void FramePacer::observeHubTick(u32 tick)
++{
++	if (!haveTick)
++	{
++		haveTick = true;
++		lastTick = tick;
++		creditTicks += 1;
++	}
++	else
++	{
++		// Signed distance so that a stale or repeated tick adds nothing.
++		const int delta = (int)(tick - lastTick);
++		if (delta <= 0)
++			return;
++		lastTick = tick;
++		creditTicks += delta;
++	}
++	if (creditTicks > (int)cfg.maxBacklog)
++	{
++		st.droppedCredit += (u32)(creditTicks - (int)cfg.maxBacklog);
++		creditTicks = (int)cfg.maxBacklog;
++	}
++}
++
++u32 FramePacer::framesToRun()
++{
++	if (!haveTick)
++		return 1;	// no link information yet: free run, as before the first packet
++	if (creditTicks <= 0)
++	{
++		if (holdRun >= cfg.maxHoldFrames)
++		{
++			holdRun = 0;
++			st.forced++;
++			return 1;
++		}
++		holdRun++;
++		st.held++;
++		return 0;
++	}
++	holdRun = 0;
++	const u32 n = std::min<u32>((u32)creditTicks, std::max<u32>(cfg.maxCatchUp, 1));
++	st.caughtUp += n - 1;
++	return n;
++}
++
++void FramePacer::onFrameRun()
++{
++	creditTicks--;
++	// A forced frame borrows from the next tick; never run up an unbounded debt.
++	if (creditTicks < -(int)cfg.maxBacklog)
++		creditTicks = -(int)cfg.maxBacklog;
++}
++
++void FramePacer::reset()
++{
++	st = {};
++	haveTick = false;
++	lastTick = 0;
++	creditTicks = 0;
++	holdRun = 0;
++}
++
++// ---------------------------------------------------------------------------
++// InMemoryHub
++// ---------------------------------------------------------------------------
++//
++// Timing: a slot frame published while the hub is at tick T is stamped T.
++// tick() advances to T + 1 and delivers, for every node, the newest snapshot
++// with stamp + 1 + L <= T + 1. So L = 0 delivers on the next tick and every
++// node and every seat gets the same delay (PLAN_V2 3.2).
++
++struct InMemoryHub::Impl
++{
++	struct Snapshot
++	{
++		u32 stamp;
++		u32 id;				// per node, increasing
++		u16 packetNumber;
++		std::vector<u8> bytes;
++	};
++	struct Seat
++	{
++		bool attached = false;
++		std::vector<u8> rx;				// persistent: absent slots keep old bytes
++		std::vector<u32> usedId;		// snapshot id used per node, 0 = none
++		std::vector<u8> pending;		// assembled frame not yet taken
++		bool hasPending = false;
++		u32 droppedPending = 0;
++		u16 prevPacketNumber = 0;
++	};
++
++	int n;
++	Edition edition;
++	u32 delay;
++	u32 sessionTag;
++	u32 tick = 0;
++	u32 slotSize = 0;
++	bool failed = false;
++	std::vector<std::deque<Snapshot>> nodes;
++	std::vector<u32> nextId;
++	std::vector<Seat> seats;
++	Stats stats;
++	mutable std::mutex mutex;
++	std::condition_variable cond;
++
++	Impl(int n, Edition edition, u32 delay, u32 sessionTag)
++		: n(n), edition(edition), delay(delay), sessionTag(sessionTag),
++		  nodes(n), nextId(n, 1), seats(n) {}
++
++	const Snapshot *delayed(int node) const
++	{
++		const Snapshot *best = nullptr;
++		for (const Snapshot& s : nodes[node])
++			if (s.stamp + 1 + delay <= tick)
++				best = &s;
++		return best;
++	}
++
++	void prune()
++	{
++		for (int i = 0; i < n; i++)
++		{
++			auto& q = nodes[i];
++			while (q.size() >= 2 && q[1].stamp + 1 + delay <= tick)
++				q.pop_front();
++		}
++	}
++
++	FrameCheck submit(const u8 *bytes, u32 size)
++	{
++		WireExpect expect;
++		expect.edition = edition;
++		expect.sessionTag = sessionTag;
++		expect.slotCount = n;
++		expect.slotSize = slotSize;
++		SlotFrameHeader h;
++		FrameCheck c = checkSlotFrame(bytes, size, expect, &h);
++		if (c != FrameCheck::Ok)
++		{
++			if (c == FrameCheck::BadEdition) stats.badEdition++;
++			else if (c == FrameCheck::BadSize) stats.badSize++;
++			else stats.badHeader++;
++			return c;
++		}
++		slotSize = h.slotSize;
++		Snapshot s;
++		s.stamp = tick;
++		s.id = nextId[h.nodeId]++;
++		s.packetNumber = h.packetNumber;
++		s.bytes.assign(bytes + sizeof(h), bytes + size);
++		auto& q = nodes[h.nodeId];
++		// Several frames from one node within one hub tick: latest wins.
++		if (!q.empty() && q.back().stamp == tick)
++			q.back() = std::move(s);
++		else
++			q.push_back(std::move(s));
++		stats.accepted++;
++		return FrameCheck::Ok;
++	}
++
++	void doTick()
++	{
++		tick++;
++		if (slotSize == 0)
++			return;
++		const u32 S = slotSize;
++		std::vector<const Snapshot *> snap(n);
++		for (int i = 0; i < n; i++)
++			snap[i] = delayed(i);
++		for (int t = 0; t < n; t++)
++		{
++			Seat& seat = seats[t];
++			if (!seat.attached)
++				continue;
++			if (seat.rx.size() != S * (u32)n)
++				seat.rx.assign(S * (u32)n, 0);
++			if (seat.usedId.size() != (size_t)n)
++				seat.usedId.assign(n, 0);
++			bool changed = false;
++			for (int i = 0; i < n; i++)
++				if (snap[i] != nullptr && snap[i]->id != seat.usedId[i])
++					changed = true;
++			if (!changed)
++				continue;	// nothing new for this seat: it will see a stale take()
++			std::vector<const u8 *> latest(n);
++			for (int i = 0; i < n; i++)
++			{
++				latest[i] = snap[i] != nullptr ? snap[i]->bytes.data() : nullptr;
++				seat.usedId[i] = snap[i] != nullptr ? snap[i]->id : 0;
++			}
++			assembleRx(latest.data(), n, t, S, seat.rx.data());
++			const int pred = rxSourceNode(t, n, 1);
++			if (snap[pred] != nullptr)
++				seat.prevPacketNumber = snap[pred]->packetNumber;
++
++			AssembledFrameHeader h;
++			h.magic = kAssembledMagic;
++			h.version = kWireVersion;
++			h.edition = (u8)edition;
++			h.targetNode = (u8)t;
++			h.slotCount = (u8)n;
++			h.slotSize = (u16)S;
++			h.prevPacketNumber = seat.prevPacketNumber;
++			h.hubTick = tick;
++			h.releaseFrame = tick;
++			h.sessionTag = sessionTag;
++			if (seat.hasPending)
++				seat.droppedPending++;
++			seat.pending.resize(sizeof(h) + seat.rx.size());
++			std::memcpy(seat.pending.data(), &h, sizeof(h));
++			std::memcpy(seat.pending.data() + sizeof(h), seat.rx.data(), seat.rx.size());
++			seat.hasPending = true;
++		}
++		prune();
++		cond.notify_all();
++	}
++};
++
++namespace {
++
++class InMemorySeat : public RingBackend
++{
++public:
++	InMemorySeat(InMemoryHub::Impl& hub, int slotId, Edition edition)
++		: hub(hub)
++	{
++		r.slotId = slotId;
++		r.slotCount = hub.n;
++		r.edition = edition;
++	}
++
++	~InMemorySeat() override {
++		shutdown();
++	}
++
++	RingRole role() const override { return r; }
++
++	bool publish(const u8 *txBase, u32 slotSize, u32 slotCount, u16 packetNumber) override
++	{
++		if (closed)
++			return false;
++		std::vector<u8> frame = encodeSlotFrame(txBase, slotSize, r.slotId, (int)slotCount,
++				r.edition, packetNumber, localFrame++, hub.sessionTag);
++		std::lock_guard<std::mutex> _(hub.mutex);
++		st.published++;
++		// A refused frame (foreign edition, bad size) is dropped and counted by
++		// the hub; it is not a link error, as a stray UDP packet is not.
++		FrameCheck c = hub.submit(frame.data(), (u32)frame.size());
++		countCheck(c, st);
++		return true;
++	}
++
++	TakeResult take(u8 *rxBase, u32 slotSize, u32 slotCount, u32 waitMs) override
++	{
++		TakeResult res;
++		std::unique_lock<std::mutex> lock(hub.mutex);
++		Seat& seat = hub.seats[r.slotId];
++		if (hub.failed || closed) {
++			res.error = true;
++			return res;
++		}
++		if (!seat.hasPending && waitMs > 0)
++			hub.cond.wait_for(lock, std::chrono::milliseconds(waitMs),
++					[&] { return seat.hasPending || hub.failed; });
++		if (hub.failed) {
++			res.error = true;
++			return res;
++		}
++		st.dropped += seat.droppedPending;
++		seat.droppedPending = 0;
++		if (!seat.hasPending) {
++			st.stale++;
++			return res;
++		}
++		seat.hasPending = false;
++		WireExpect expect;
++		expect.edition = r.edition;
++		expect.sessionTag = hub.sessionTag;
++		expect.slotCount = (int)slotCount;
++		expect.slotSize = slotSize;
++		expect.targetNode = r.slotId;
++		AssembledFrameHeader h;
++		FrameCheck c = checkAssembledFrame(seat.pending.data(), (u32)seat.pending.size(), expect, &h);
++		if (c != FrameCheck::Ok || (haveTick && (int)(h.hubTick - lastTick) <= 0))
++		{
++			countCheck(c, st);
++			st.stale++;
++			return res;
++		}
++		haveTick = true;
++		lastTick = h.hubTick;
++		std::memcpy(rxBase, seat.pending.data() + sizeof(h), rxRegionSize(slotSize, (int)slotCount));
++		st.taken++;
++		res.fresh = true;
++		res.packetNumber = h.prevPacketNumber;
++		res.hubTick = h.hubTick;
++		return res;
++	}
++
++	bool peekHubTick(u32 *tick) override
++	{
++		std::lock_guard<std::mutex> _(hub.mutex);
++		Seat& seat = hub.seats[r.slotId];
++		if (!seat.hasPending)
++		{
++			if (!haveTick)
++				return false;
++			*tick = lastTick;
++			return true;
++		}
++		AssembledFrameHeader h;
++		std::memcpy(&h, seat.pending.data(), sizeof(h));
++		*tick = h.hubTick;
++		return true;
++	}
++
++	void shutdown() override
++	{
++		if (closed)
++			return;
++		closed = true;
++		std::lock_guard<std::mutex> _(hub.mutex);
++		hub.seats[r.slotId].attached = false;
++		hub.seats[r.slotId].hasPending = false;
++	}
++
++	Stats stats() const override { return st; }
++
++private:
++	using Seat = InMemoryHub::Impl::Seat;
++	InMemoryHub::Impl& hub;
++	RingRole r;
++	Stats st;
++	u32 localFrame = 0;
++	bool haveTick = false;
++	u32 lastTick = 0;
++	bool closed = false;
++};
++
++} // namespace
++
++InMemoryHub::InMemoryHub(int slotCount, Edition edition, u32 delayFrames, u32 sessionTag)
++	: impl(std::make_unique<Impl>(std::clamp(slotCount, 2, kMaxRingNodes), edition, delayFrames, sessionTag))
++{
++}
++
++InMemoryHub::~InMemoryHub() = default;
++
++std::unique_ptr<RingBackend> InMemoryHub::attach(int slotId, Edition seatEdition)
++{
++	if (slotId < 0 || slotId >= impl->n)
++		return nullptr;
++	std::lock_guard<std::mutex> _(impl->mutex);
++	Impl::Seat& seat = impl->seats[slotId];
++	if (seat.attached)
++		return nullptr;
++	seat = Impl::Seat();
++	seat.attached = true;
++	return std::make_unique<InMemorySeat>(*impl, slotId, seatEdition);
++}
++
++std::unique_ptr<RingBackend> InMemoryHub::attach(int slotId) {
++	return attach(slotId, impl->edition);
++}
++
++void InMemoryHub::tick()
++{
++	std::lock_guard<std::mutex> _(impl->mutex);
++	impl->doTick();
++}
++
++void InMemoryHub::fail()
++{
++	std::lock_guard<std::mutex> _(impl->mutex);
++	impl->failed = true;
++	impl->cond.notify_all();
++}
++
++FrameCheck InMemoryHub::submit(const u8 *bytes, u32 size)
++{
++	std::lock_guard<std::mutex> _(impl->mutex);
++	return impl->submit(bytes, size);
++}
++
++u32 InMemoryHub::hubTick() const
++{
++	std::lock_guard<std::mutex> _(impl->mutex);
++	return impl->tick;
++}
++
++InMemoryHub::Stats InMemoryHub::stats() const
++{
++	std::lock_guard<std::mutex> _(impl->mutex);
++	return impl->stats;
++}
++
++// ---------------------------------------------------------------------------
++// Mailbox
++// ---------------------------------------------------------------------------
++//
++// The buffer io is the byte-exact reference for the JS side. It is not
++// thread-safe: in the browser the JS glue uses Atomics on the SAB for the
++// i32 header words, and the transport writes a frame into a buffer that is
++// not latestIndex before publishing it (triple buffering).
++
++static u32 rd32(const u8 *p) { u32 v; std::memcpy(&v, p, 4); return v; }
++static void wr32(u8 *p, u32 v) { std::memcpy(p, &v, 4); }
++
++namespace {
++
++class BufferMailboxIo : public MailboxIo
++{
++public:
++	explicit BufferMailboxIo(u8 *region) : region(region) {}
++
++	u32 pullLatest(u8 *dst, u32 capacity, u32 *seqOut) override
++	{
++		*seqOut = rd32(region + MailboxLayout::seq);
++		if (*seqOut == 0)
++			return 0;
++		const u32 idx = rd32(region + MailboxLayout::latestIndex) % 3;
++		const u32 len = std::min(rd32(region + MailboxLayout::rxLength + 4 * idx), MailboxLayout::bufferBytes);
++		std::memcpy(dst, region + MailboxLayout::rxBuffer((int)idx), std::min(len, capacity));
++		return len;
++	}
++
++	void waitSeq(u32 seenSeq, u32 ms) override {
++		// Single-threaded reference: nothing can change while we wait.
++		(void)seenSeq; (void)ms;
++	}
++
++	void push(const u8 *frame, u32 length) override
++	{
++		length = std::min(length, (u32)(sizeof(SlotFrameHeader) + kMaxPayload));
++		std::memcpy(region + MailboxLayout::txBuffer, frame, length);
++		wr32(region + MailboxLayout::txLength, length);
++		wr32(region + MailboxLayout::txSeq, rd32(region + MailboxLayout::txSeq) + 1);
++	}
++
++	bool linkError() override {
++		return rd32(region + MailboxLayout::errorFlag) != 0;
++	}
++
++private:
++	u8 *region;
++};
++
++class MailboxRing : public RingBackend
++{
++public:
++	MailboxRing(const MailboxConfig& config, std::unique_ptr<MailboxIo> io)
++		: cfg(config), io(std::move(io)), buf(MailboxLayout::bufferBytes) {}
++
++	RingRole role() const override { return cfg.role; }
++	u32 defaultWaitMs() const override { return cfg.waitMs; }
++
++	bool publish(const u8 *txBase, u32 slotSize, u32 slotCount, u16 packetNumber) override
++	{
++		if (closed || slotSize == 0 || slotSize > kMaxPayload)
++			return !closed;
++		std::vector<u8> frame = encodeSlotFrame(txBase, slotSize, cfg.role.slotId, (int)slotCount,
++				cfg.role.edition, packetNumber, localFrame++, cfg.sessionTag);
++		io->push(frame.data(), (u32)frame.size());
++		st.published++;
++		return true;
++	}
++
++	TakeResult take(u8 *rxBase, u32 slotSize, u32 slotCount, u32 waitMs) override
++	{
++		TakeResult res;
++		if (closed || io->linkError()) {
++			res.error = true;
++			return res;
++		}
++		u32 seq;
++		u32 len = io->pullLatest(buf.data(), (u32)buf.size(), &seq);
++		if (seq == lastSeq && waitMs > 0)
++		{
++			io->waitSeq(lastSeq, waitMs);
++			if (io->linkError()) {
++				res.error = true;
++				return res;
++			}
++			len = io->pullLatest(buf.data(), (u32)buf.size(), &seq);
++		}
++		if (seq == lastSeq) {
++			st.stale++;
++			return res;
++		}
++		// Deliveries between two takes that were never read (latest wins).
++		const u32 skipped = seq - lastSeq - 1;
++		st.dropped += skipped;
++		lastSeq = seq;
++
++		WireExpect expect;
++		expect.edition = cfg.role.edition;
++		expect.sessionTag = cfg.sessionTag;
++		expect.slotCount = (int)slotCount;
++		expect.slotSize = slotSize;
++		expect.targetNode = cfg.role.slotId;
++		AssembledFrameHeader h;
++		FrameCheck c = checkAssembledFrame(buf.data(), len, expect, &h);
++		if (c != FrameCheck::Ok || (haveTick && (int)(h.hubTick - lastTick) <= 0))
++		{
++			countCheck(c, st);
++			st.stale++;
++			return res;
++		}
++		haveTick = true;
++		lastTick = h.hubTick;
++		std::memcpy(rxBase, buf.data() + sizeof(h), rxRegionSize(slotSize, (int)slotCount));
++		st.taken++;
++		res.fresh = true;
++		res.packetNumber = h.prevPacketNumber;
++		res.hubTick = h.hubTick;
++		return res;
++	}
++
++	bool peekHubTick(u32 *tick) override
++	{
++		u32 seq;
++		AssembledFrameHeader h;
++		u32 len = io->pullLatest((u8 *)&h, sizeof(h), &seq);
++		if (len >= sizeof(h) && h.magic == kAssembledMagic) {
++			*tick = h.hubTick;
++			return true;
++		}
++		return false;
++	}
++
++	void shutdown() override { closed = true; }
++	Stats stats() const override { return st; }
++
++private:
++	MailboxConfig cfg;
++	std::unique_ptr<MailboxIo> io;
++	std::vector<u8> buf;
++	Stats st;
++	u32 lastSeq = 0;
++	u32 localFrame = 0;
++	bool haveTick = false;
++	u32 lastTick = 0;
++	bool closed = false;
++};
++
++} // namespace
++
++std::unique_ptr<MailboxIo> makeBufferMailboxIo(u8 *region) {
++	return std::make_unique<BufferMailboxIo>(region);
++}
++
++void mailboxDeliver(u8 *region, const u8 *frame, u32 length)
++{
++	length = std::min(length, MailboxLayout::bufferBytes);
++	const u32 seq = rd32(region + MailboxLayout::seq);
++	const u32 idx = seq == 0 ? 0 : (rd32(region + MailboxLayout::latestIndex) + 1) % 3;
++	std::memcpy(region + MailboxLayout::rxBuffer((int)idx), frame, length);
++	wr32(region + MailboxLayout::rxLength + 4 * idx, length);
++	wr32(region + MailboxLayout::latestIndex, idx);
++	wr32(region + MailboxLayout::seq, seq + 1);
++}
++
++u32 mailboxReadTx(const u8 *region, u8 *dst, u32 capacity, u32 *txSeqOut)
++{
++	*txSeqOut = rd32(region + MailboxLayout::txSeq);
++	const u32 len = rd32(region + MailboxLayout::txLength);
++	std::memcpy(dst, region + MailboxLayout::txBuffer, std::min(len, capacity));
++	return len;
++}
++
++void mailboxSetError(u8 *region, bool error) {
++	wr32(region + MailboxLayout::errorFlag, error ? 1 : 0);
++}
++
++std::unique_ptr<RingBackend> makeMailboxRingBackend(const MailboxConfig& config,
++		std::unique_ptr<MailboxIo> io)
++{
++	return std::make_unique<MailboxRing>(config, std::move(io));
++}
++
++// ---------------------------------------------------------------------------
++// InMemoryCabinet (multiboard, one process)
++// ---------------------------------------------------------------------------
++
++struct InMemoryCabinet::Impl
++{
++	std::mutex mutex;
++	std::condition_variable cond;
++	u16 status = 0;
++	bool exit = false;
++	u32 generation = 0;
++	u32 arrived = 0;		// bit per board
++	u32 boardMask = 1;		// master only until startPartners()
++	std::vector<u16> data = std::vector<u16>(kMbDataWords);
++	std::function<void(int)> *starter = nullptr;
++};
++
++namespace {
++
++class InMemoryBoard : public MultiboardBackend
++{
++public:
++	InMemoryBoard(std::shared_ptr<InMemoryCabinet::Impl> cab, int id, std::function<void(int)> *starter)
++		: cab(std::move(cab)), id(id), starter(starter) {}
++
++	int boardId() const override { return id; }
++
++	u16 status() const override { std::lock_guard<std::mutex> _(cab->mutex); return cab->status; }
++	void setStatus(u16 v) override { std::lock_guard<std::mutex> _(cab->mutex); cab->status = v; }
++	void statusOr(u16 bits) override { std::lock_guard<std::mutex> _(cab->mutex); cab->status |= bits; }
++	void statusAnd(u16 bits) override { std::lock_guard<std::mutex> _(cab->mutex); cab->status &= bits; }
++
++	u16 read16(u32 i) const override { return cab->data[i & (kMbDataWords - 1)]; }
++	void write16(u32 i, u16 v) override { cab->data[i & (kMbDataWords - 1)] = v; }
++	u32 read32(u32 i) const override
++	{
++		i &= kMbDataWords - 1;
++		u32 v = cab->data[i];
++		if (i + 1 < kMbDataWords)
++			v |= (u32)cab->data[i + 1] << 16;
++		return v;
++	}
++	void write32(u32 i, u32 v) override
++	{
++		i &= kMbDataWords - 1;
++		cab->data[i] = (u16)v;
++		if (i + 1 < kMbDataWords)
++			cab->data[i + 1] = (u16)(v >> 16);
++	}
++	void copyOut(u32 i, void *dst, u32 bytes) const override
++	{
++		i &= kMbDataWords - 1;
++		bytes = std::min<u32>(bytes, (kMbDataWords - i) * 2);
++		std::memcpy(dst, &cab->data[i], bytes);
++	}
++	const u16 *directData() const override { return cab->data.data(); }
++
++	BarrierResult barrier(u32 timeoutMs) override
++	{
++		std::unique_lock<std::mutex> lock(cab->mutex);
++		if (id != 0 && cab->exit)
++			return BarrierResult::Exit;
++		const u32 g = cab->generation;
++		cab->arrived |= 1u << id;
++		if ((cab->arrived & cab->boardMask) == cab->boardMask)
++		{
++			cab->arrived = 0;
++			cab->generation++;
++			cab->cond.notify_all();
++			return BarrierResult::Ok;
++		}
++		bool done = cab->cond.wait_for(lock, std::chrono::milliseconds(timeoutMs),
++				[&] { return cab->generation != g || (id != 0 && cab->exit); });
++		if (id != 0 && cab->exit)
++			return BarrierResult::Exit;
++		return done ? BarrierResult::Ok : BarrierResult::Timeout;
++	}
++
++	void requestExit() override
++	{
++		std::lock_guard<std::mutex> _(cab->mutex);
++		cab->exit = true;
++		cab->cond.notify_all();
++	}
++
++	void startPartners(int slaves) override
++	{
++		slaves = std::clamp(slaves, 0, kMbMaxBoards - 1);
++		{
++			std::lock_guard<std::mutex> _(cab->mutex);
++			cab->boardMask = (1u << (slaves + 1)) - 1;
++			cab->arrived = 0;
++		}
++		if (starter != nullptr && *starter)
++			for (int i = 1; i <= slaves; i++)
++				(*starter)(i);
++	}
++
++private:
++	std::shared_ptr<InMemoryCabinet::Impl> cab;
++	int id;
++	std::function<void(int)> *starter;
++};
++
++} // namespace
++
++InMemoryCabinet::InMemoryCabinet() : impl(std::make_shared<Impl>()) {}
++InMemoryCabinet::~InMemoryCabinet() = default;
++
++std::unique_ptr<MultiboardBackend> InMemoryCabinet::attach(int boardId)
++{
++	if (boardId < 0 || boardId >= kMbMaxBoards)
++		return nullptr;
++	return std::make_unique<InMemoryBoard>(impl, boardId, &partnerStarter);
++}
++
++} // namespace linkbus
+diff --git a/core/network/linkbus.h b/core/network/linkbus.h
+new file mode 100644
+index 000000000..adeb44c64
+--- /dev/null
++++ b/core/network/linkbus.h
+@@ -0,0 +1,458 @@
++/*
++	LinkBus: transport seam for the NAOMI M3 comm ring and the NAOMI multiboard
++	link (DOC browser program, PLAN_V2 item 2.10, decision D-061).
++
++	Copyright (C) 2026 John R Reeves III
++	SPDX-License-Identifier: GPL-2.0-or-later
++
++	This program is free software: you can redistribute it and/or modify
++	it under the terms of the GNU General Public License as published by
++	the Free Software Foundation, either version 2 of the License, or
++	(at your option) any later version.
++
++	This program is distributed in the hope that it will be useful,
++	but WITHOUT ANY WARRANTY; without even the implied warranty of
++	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++	GNU General Public License for more details.
++
++	Design: ext/linkbus/LINKBUS.md (call-site map at 8412d3d8a).
++
++	This header and linkbus.cpp use the C++ standard library only, so that
++	they can be unit-tested outside the Flycast tree (tests/linkbus). The
++	Flycast-specific pieces live in linkbus_udp.cpp (native UDP ring),
++	linkbus_web.cpp (JS bridge) and multiboard.cpp (shared memory backend).
++
++	Backends:
++	  ring:       UdpRing (native default, exact 8412d3d8a behaviour),
++	              InMemoryHub seats (one process), Mailbox (JS bridged).
++	  multiboard: Shm (native default, in multiboard.cpp), InMemory (one
++	              process), Sab (JS bridged).
++*/
++#pragma once
++
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <functional>
++#include <memory>
++
++namespace linkbus
++{
++
++using u8 = std::uint8_t;
++using u16 = std::uint16_t;
++using u32 = std::uint32_t;
++
++// ---------------------------------------------------------------------------
++// Common
++// ---------------------------------------------------------------------------
++
++// Edition tag carried by every star frame and by the join (PLAN_V2 I2). A frame
++// whose edition differs from the local one is dropped and counted.
++enum class Edition : u8
++{
++	Unknown = 0,
++	A = 1,	// stock Rev C
++	B = 2,	// Rev C plus FIXROM Q01, Q04, Q17
++};
++
++// ---------------------------------------------------------------------------
++// Part 1: ring (replaces NaomiNetwork as used by NaomiM3Comm)
++// ---------------------------------------------------------------------------
++//
++//   comm_ram[0x0000..0x001f]  CommBoardStat, transcnt at +6
++//   comm_ram[0x0100 + 0*S]    own slot (DMA OUT)
++//   comm_ram[0x0100 + k*S]    k = 1..n: slot of node (own + n - k) mod n;
++//                             k = n is the own slot back from a full lap.
++
++constexpr u32 kCommTxOffset = 0x100;
++constexpr u32 kMaxPayload = 0x4000;		// NaomiNetwork Packet payload size
++constexpr int kMaxRingNodes = 16;
++
++// RX source for slot k (1 <= k <= n) at node `own` of an n-node ring.
++constexpr int rxSourceNode(int own, int n, int k)
++{
++	return (own + n - (k % n)) % n;
++}
++
++constexpr u32 rxSlotOffset(u32 slotSize, int k)
++{
++	return kCommTxOffset + slotSize * (u32)k;
++}
++
++constexpr u32 rxRegionSize(u32 slotSize, int slotCount)
++{
++	return slotSize * (u32)slotCount;
++}
++
++struct RingRole
++{
++	int slotId = 0;			// 0 = master, 1..n-1 = satellites
++	int slotCount = 0;		// n; < 2 means no link
++	Edition edition = Edition::Unknown;
++};
++
++struct TakeResult
++{
++	bool fresh = false;		// a newer frame was copied in; false: rxBase untouched
++	u16 packetNumber = 0;	// for CommBoardStat.transcnt, only when fresh
++	bool error = false;		// fatal: caller zeroes comm_status1/2
++	u32 hubTick = 0;		// star backends: tick of the frame taken (pacing)
++};
++
++class RingBackend
++{
++public:
++	virtual ~RingBackend() = default;
++
++	virtual RingRole role() const = 0;
++
++	// How long NaomiM3Comm::vblank() lets take() wait for a fresh frame.
++	// UDP: 100 (native parity). Star backends: 0 by default.
++	virtual u32 defaultWaitMs() const { return 0; }
++
++	// txBase = &comm_ram[kCommTxOffset], valid for slotSize * slotCount bytes.
++	// Ring backends send all of it; star backends send the first slotSize.
++	// Never blocks. Returns false on a fatal error.
++	virtual bool publish(const u8 *txBase, u32 slotSize, u32 slotCount,
++			u16 packetNumber) = 0;
++
++	// rxBase = &comm_ram[kCommTxOffset + slotSize]; filled for
++	// rxRegionSize(slotSize, slotCount) bytes when fresh.
++	virtual TakeResult take(u8 *rxBase, u32 slotSize, u32 slotCount,
++			u32 waitMs) = 0;
++
++	virtual void shutdown() = 0;
++
++	// Star backends: newest hub tick available, without consuming it (for
++	// FramePacer). Returns false when unknown (UDP, nothing received yet).
++	virtual bool peekHubTick(u32 *tick) { (void)tick; return false; }
++
++	struct Stats
++	{
++		u32 published = 0;
++		u32 taken = 0;
++		u32 stale = 0;			// take() with no fresh frame
++		u32 dropped = 0;		// frames overwritten before being taken
++		u32 badEdition = 0;
++		u32 badSize = 0;
++		u32 badHeader = 0;		// magic, version, target, session
++	};
++	virtual Stats stats() const = 0;
++};
++
++// Installed backend. When nothing is installed, NaomiM3Comm uses the native
++// UDP ring (makeUdpRingBackend()), so native builds behave as at 8412d3d8a.
++RingBackend *ringBackend();
++void setRingBackend(std::unique_ptr<RingBackend> backend);
++bool ringBackendInstalled();
++
++// Native backend over the NaomiNetwork UDP ring (linkbus_udp.cpp).
++std::unique_ptr<RingBackend> makeUdpRingBackend();
++
++// ---- Star wire format ------------------------------------------------------
++// Little-endian. Slot payload bytes are copied verbatim, never interpreted.
++
++constexpr u32 kSlotMagic = 0x3152424C;		// "LBR1"
++constexpr u32 kAssembledMagic = 0x3141424C;	// "LBA1"
++constexpr u8 kWireVersion = 1;
++
++#pragma pack(push, 1)
++// Seat -> hub: one per vblank, followed by slotSize payload bytes.
++struct SlotFrameHeader
++{
++	u32 magic;
++	u8 version;
++	u8 edition;
++	u8 nodeId;
++	u8 slotCount;
++	u16 slotSize;
++	u16 packetNumber;
++	u32 localFrame;		// sender publish counter since link start
++	u32 sessionTag;
++};
++
++// Hub -> seat: followed by slotSize * slotCount bytes in rxSourceNode() order.
++struct AssembledFrameHeader
++{
++	u32 magic;
++	u8 version;
++	u8 edition;
++	u8 targetNode;
++	u8 slotCount;
++	u16 slotSize;
++	u16 prevPacketNumber;	// packetNumber of node (target + n - 1) mod n
++	u32 hubTick;			// strictly increasing; freshness test
++	u32 releaseFrame;		// equal-delay release point (PLAN_V2 3.2)
++	u32 sessionTag;
++};
++#pragma pack(pop)
++
++static_assert(sizeof(SlotFrameHeader) == 20, "SlotFrameHeader layout");
++static_assert(sizeof(AssembledFrameHeader) == 24, "AssembledFrameHeader layout");
++
++// Reference assembly. latest[i] is node i's newest delayed slot or nullptr
++// (that RX slot is then left unchanged in rxOut).
++inline void assembleRx(const u8 *const latest[], int n, int own, u32 slotSize,
++		u8 *rxOut)
++{
++	for (int k = 1; k <= n; k++)
++	{
++		const u8 *src = latest[rxSourceNode(own, n, k)];
++		if (src != nullptr)
++			std::memcpy(rxOut + slotSize * (u32)(k - 1), src, slotSize);
++	}
++}
++
++// Validation shared by the hub, the in-memory seats and the mailbox seats.
++enum class FrameCheck
++{
++	Ok,
++	BadHeader,		// magic, version, session, node or target out of range
++	BadEdition,
++	BadSize,		// slot size, slot count or byte count mismatch
++};
++
++struct WireExpect
++{
++	Edition edition = Edition::Unknown;
++	u32 sessionTag = 0;
++	int slotCount = 0;		// 0 = not checked (hub learns it from the first frame)
++	u32 slotSize = 0;		// 0 = not checked
++	int targetNode = -1;	// assembled frames only; -1 = not checked
++};
++
++FrameCheck checkSlotFrame(const u8 *bytes, u32 size, const WireExpect& expect,
++		SlotFrameHeader *out);
++FrameCheck checkAssembledFrame(const u8 *bytes, u32 size, const WireExpect& expect,
++		AssembledFrameHeader *out);
++
++// ---- Frame pacing (CLAIM_FAIRNESS R3) ----------------------------------------
++// Natively, the 100 ms receive spin in vblank couples every board's frame rate
++// to its ring predecessor. Star backends never block, so the host loop must
++// pace each seat: one local frame per hub tick (master pass), holding when the
++// hub is behind and catching up a bounded number of frames when it is ahead.
++// The pacer only advises; the host (worker loop) decides whether to run
++// retro_run(). Nothing here changes game state.
++class FramePacer
++{
++public:
++	struct Config
++	{
++		u32 maxHoldFrames = 6;	// consecutive holds before running anyway (like the native timeout)
++		u32 maxCatchUp = 2;		// local frames per host frame when behind
++		u32 maxBacklog = 8;		// credit above this is dropped (counted)
++	};
++	FramePacer() = default;
++	explicit FramePacer(const Config& config) : cfg(config) {}
++
++	// Called once per host frame, before framesToRun(), with the newest hub
++	// tick available to this seat (RingBackend::peekHubTick() or, in the
++	// browser, read by JS from the mailbox). Polling outside take() avoids a
++	// deadlock: a held seat runs no vblank, so it never calls take().
++	void observeHubTick(u32 tick);
++	// How many local frames to run now (0..maxCatchUp).
++	u32 framesToRun();
++	// Called after each local frame actually run.
++	void onFrameRun();
++
++	struct Stats
++	{
++		u32 held = 0;			// host frames with 0 local frames
++		u32 forced = 0;			// frames run after maxHoldFrames without credit
++		u32 caughtUp = 0;		// extra frames run beyond 1 in a host frame
++		u32 droppedCredit = 0;	// ticks discarded above maxBacklog
++	};
++	Stats stats() const { return st; }
++	int credit() const { return creditTicks; }
++	void reset();
++
++private:
++	Config cfg;
++	Stats st;
++	bool haveTick = false;
++	u32 lastTick = 0;
++	int creditTicks = 0;
++	u32 holdRun = 0;
++};
++
++// ---- In-memory star (native tests, single-page play) -----------------------
++// All seats in one process. The driver calls tick() once per hub frame;
++// delayFrames is the equal delay L. A seat's publish() goes through the same
++// wire encoding and checks as a remote seat.
++class InMemoryHub
++{
++public:
++	InMemoryHub(int slotCount, Edition edition, u32 delayFrames, u32 sessionTag = 0x4C424D31);
++	~InMemoryHub();
++	InMemoryHub(const InMemoryHub&) = delete;
++	InMemoryHub& operator=(const InMemoryHub&) = delete;
++
++	// Seat backends hold a reference to the hub; destroy them first.
++	std::unique_ptr<RingBackend> attach(int slotId, Edition seatEdition);
++	std::unique_ptr<RingBackend> attach(int slotId);
++	void tick();
++	void fail();
++
++	// Raw wire entry point (also used by tests to inject foreign frames).
++	FrameCheck submit(const u8 *bytes, u32 size);
++	u32 hubTick() const;
++
++	struct Stats
++	{
++		u32 accepted = 0;
++		u32 badEdition = 0;
++		u32 badSize = 0;
++		u32 badHeader = 0;
++	};
++	Stats stats() const;
++
++	struct Impl;
++private:
++	std::unique_ptr<Impl> impl;
++};
++
++// ---- Mailbox (browser) ------------------------------------------------------
++// Byte layout of the mailbox SharedArrayBuffer, shared with the JS host.
++// The transport writes assembled frames to one of three RX buffers, stores
++// latestIndex, then bumps seq. The core writes its slot frame to txBuffer and
++// bumps txSeq.
++
++struct MailboxLayout
++{
++	static constexpr u32 seq = 0;			// i32
++	static constexpr u32 latestIndex = 4;	// i32, 0..2
++	static constexpr u32 errorFlag = 8;		// i32, nonzero = link lost
++	static constexpr u32 txSeq = 12;		// i32
++	static constexpr u32 rxLength = 16;		// i32[3] at 16, 20, 24: bytes in rx buffer i
++	static constexpr u32 txLength = 28;		// i32
++	static constexpr u32 headerBytes = 64;
++	static constexpr u32 bufferBytes = sizeof(AssembledFrameHeader) + kMaxPayload;
++	static constexpr u32 rxBuffer(int i) { return headerBytes + bufferBytes * (u32)i; }
++	static constexpr u32 txBuffer = headerBytes + bufferBytes * 3;
++	static constexpr u32 totalBytes = txBuffer + sizeof(SlotFrameHeader) + kMaxPayload;
++};
++
++// The core's access to a mailbox. Native/test: a plain byte buffer
++// (makeBufferMailboxIo). Browser: JS imports over the SAB (linkbus_web.cpp).
++class MailboxIo
++{
++public:
++	virtual ~MailboxIo() = default;
++	// Copy min(capacity, length) bytes of the newest RX frame. Returns its full
++	// length (0 if none) and the delivery count seq (0 = nothing delivered yet).
++	virtual u32 pullLatest(u8 *dst, u32 capacity, u32 *seqOut) = 0;
++	// Wait up to ms for seq to differ from `seenSeq`. May return early.
++	virtual void waitSeq(u32 seenSeq, u32 ms) = 0;
++	virtual void push(const u8 *frame, u32 length) = 0;
++	virtual bool linkError() = 0;
++};
++
++// Buffer-backed io over a MailboxLayout region (tests, and the reference for
++// the JS side). The region must stay alive while the io is used.
++std::unique_ptr<MailboxIo> makeBufferMailboxIo(u8 *region);
++// Transport-side helpers for the same region (what JS does).
++void mailboxDeliver(u8 *region, const u8 *frame, u32 length);
++u32 mailboxReadTx(const u8 *region, u8 *dst, u32 capacity, u32 *txSeqOut);
++void mailboxSetError(u8 *region, bool error);
++
++struct MailboxConfig
++{
++	RingRole role;
++	u32 sessionTag = 0;
++	u32 waitMs = 0;		// default for NaomiM3Comm (0: never block the worker)
++};
++std::unique_ptr<RingBackend> makeMailboxRingBackend(const MailboxConfig& config,
++		std::unique_ptr<MailboxIo> io);
++
++// ---------------------------------------------------------------------------
++// Part 2: multiboard (replaces shm, IPC mutex/condvar and os_RunInstance)
++// ---------------------------------------------------------------------------
++
++constexpr u32 kMbDataWords = 0x100000 / sizeof(u16);	// MEM_SIZE
++constexpr int kMbMaxBoards = 4;
++constexpr int kMbBaseSyncCycles = 836208;
++constexpr u32 kMbBarrierTimeoutMs = 5000;
++
++struct MultiboardSabLayout
++{
++	static constexpr u32 status = 0;		// i32, low 16 bits = native status
++	static constexpr u32 exit = 4;			// i32
++	static constexpr u32 generation = 8;	// i32
++	static constexpr u32 arrived = 12;		// i32
++	static constexpr u32 boardMask = 16;	// i32, bit i = board i takes part in the barrier
++	static constexpr u32 headerBytes = 64;
++	static constexpr u32 data = headerBytes;
++	static constexpr u32 totalBytes = headerBytes + kMbDataWords * sizeof(u16);
++};
++
++enum class BarrierResult
++{
++	Ok,			// every board arrived
++	Timeout,	// phase 1 timed out; native logs and returns early (non-fatal)
++	Exit,		// slave: the master is gone; native throws "Slave exit"
++};
++
++class MultiboardBackend
++{
++public:
++	virtual ~MultiboardBackend() = default;
++
++	virtual int boardId() const = 0;
++
++	virtual u16 status() const = 0;
++	virtual void setStatus(u16 v) = 0;
++	virtual void statusOr(u16 bits) = 0;
++	virtual void statusAnd(u16 bits) = 0;
++
++	// Word-indexed like sharedMem->data[]. Multiboard keeps the native index
++	// arithmetic and masking. The native shm backend indexes unmasked, exactly
++	// as 8412d3d8a; the in-memory and SAB backends mask to kMbDataWords so an
++	// out-of-range index cannot leave the bank.
++	virtual u16 read16(u32 wordIndex) const = 0;
++	virtual void write16(u32 wordIndex, u16 v) = 0;
++	virtual u32 read32(u32 wordIndex) const = 0;
++	virtual void write32(u32 wordIndex, u32 v) = 0;
++	virtual void copyOut(u32 wordIndex, void *dst, u32 bytes) const = 0;
++	// Direct pointer to the bank if it lives in this address space, else nullptr.
++	virtual const u16 *directData() const { return nullptr; }
++
++	virtual BarrierResult barrier(u32 timeoutMs) = 0;
++	virtual void requestExit() = 0;
++
++	// Master, first sync point: start the partner board(s). Returns at once.
++	// Sets the number of boards taking part in the barrier to slaves + 1.
++	virtual void startPartners(int slaves) = 0;
++
++	// Desktop keyboard forwarding (slave to master). Default: none.
++	virtual void sendKeyboard(u16 code, bool pressed) { (void)code; (void)pressed; }
++	virtual bool pollKeyboard(u16 *code, bool *pressed) { (void)code; (void)pressed; return false; }
++};
++
++// Optional factory. When unset, Multiboard uses its native shared memory backend.
++using MultiboardFactory = std::function<std::unique_ptr<MultiboardBackend>(int boardId)>;
++void setMultiboardFactory(MultiboardFactory factory);
++const MultiboardFactory& multiboardFactory();
++
++// In-process cabinet (both boards in one process, threads or one thread for
++// tests). Barrier semantics: a generation barrier over the boards in
++// boardMask, the same as the SAB backend. partnerStarter is called by
++// startPartners() with the board ids to start (may be empty).
++class InMemoryCabinet
++{
++public:
++	InMemoryCabinet();
++	~InMemoryCabinet();
++	std::unique_ptr<MultiboardBackend> attach(int boardId);
++	std::function<void(int boardId)> partnerStarter;
++
++	struct Impl;
++private:
++	std::shared_ptr<Impl> impl;
++};
++
++// Browser: SAB plus Atomics through JS imports (linkbus_web.cpp, Emscripten).
++std::unique_ptr<MultiboardBackend> makeSabMultiboardBackend(int boardId);
++
++} // namespace linkbus
+diff --git a/core/network/linkbus_udp.cpp b/core/network/linkbus_udp.cpp
+new file mode 100644
+index 000000000..fe83c3eb8
+--- /dev/null
++++ b/core/network/linkbus_udp.cpp
+@@ -0,0 +1,109 @@
++/*
++	LinkBus native ring backend: the NaomiNetwork UDP ring, unchanged.
++
++	Copyright (C) 2026 John R Reeves III
++	SPDX-License-Identifier: GPL-2.0-or-later
++
++	This program is free software: you can redistribute it and/or modify
++	it under the terms of the GNU General Public License as published by
++	the Free Software Foundation, either version 2 of the License, or
++	(at your option) any later version.
++
++	This program is distributed in the hope that it will be useful,
++	but WITHOUT ANY WARRANTY; without even the implied warranty of
++	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++	GNU General Public License for more details.
++
++	Behaviour is that of NaomiM3Comm::receiveNetwork(), sendNetwork() and the
++	vblank receive loop at 8412d3d8a, moved here without change:
++	- take() polls NaomiNetwork::receive() until a packet arrives or waitMs
++	  (100 natively) has passed, then logs "No data received".
++	- The receive buffer is zero-filled and copied whole, so a short packet
++	  zeroes the rest of the RX region, and NaomiNetwork's partial erase quirk
++	  (LINKBUS.md 3.1) is kept as it is.
++	- Any FlycastException (socket error, NAK, unknown packet) is a link error.
++*/
++#include "types.h"
++#include "linkbus.h"
++#include "naomi_network.h"
++
++#include <chrono>
++#include <memory>
++
++namespace linkbus
++{
++
++namespace {
++
++class UdpRing : public RingBackend
++{
++public:
++	RingRole role() const override
++	{
++		RingRole r;
++		r.slotId = naomiNetwork.getSlotId();
++		r.slotCount = naomiNetwork.getSlotCount();
++		r.edition = Edition::Unknown;	// the UDP ring carries no edition tag
++		return r;
++	}
++
++	u32 defaultWaitMs() const override { return 100; }
++
++	bool publish(const u8 *txBase, u32 slotSize, u32 slotCount, u16 packetNumber) override
++	{
++		try {
++			naomiNetwork.send(const_cast<u8 *>(txBase), slotSize * slotCount, packetNumber);
++		} catch (const FlycastException&) {
++			return false;
++		}
++		st.published++;
++		return true;
++	}
++
++	TakeResult take(u8 *rxBase, u32 slotSize, u32 slotCount, u32 waitMs) override
++	{
++		using the_clock = std::chrono::high_resolution_clock;
++		the_clock::time_point start = the_clock::now();
++		TakeResult res;
++		const u32 packetSize = slotSize * slotCount;
++		std::unique_ptr<u8[]> buf = std::make_unique<u8[]>(packetSize);
++		u16 packetNumber = 0;
++		bool received = false;
++		try {
++			do {
++				received = naomiNetwork.receive(buf.get(), packetSize, &packetNumber);
++			} while (!received && the_clock::now() - start < std::chrono::milliseconds(waitMs));
++		} catch (const FlycastException&) {
++			res.error = true;
++			return res;
++		}
++		if (!received)
++		{
++			INFO_LOG(NETWORK, "No data received");
++			st.stale++;
++			return res;
++		}
++		memcpy(rxBase, buf.get(), packetSize);
++		st.taken++;
++		res.fresh = true;
++		res.packetNumber = packetNumber;
++		return res;
++	}
++
++	void shutdown() override {
++		naomiNetwork.shutdown();
++	}
++
++	Stats stats() const override { return st; }
++
++private:
++	Stats st;
++};
++
++} // namespace
++
++std::unique_ptr<RingBackend> makeUdpRingBackend() {
++	return std::make_unique<UdpRing>();
++}
++
++} // namespace linkbus
+diff --git a/core/network/linkbus_web.cpp b/core/network/linkbus_web.cpp
+new file mode 100644
+index 000000000..0bdb5aa8e
+--- /dev/null
++++ b/core/network/linkbus_web.cpp
+@@ -0,0 +1,364 @@
++/*
++	LinkBus browser bridge (Emscripten only): mailbox ring backend and SAB
++	multiboard backend over SharedArrayBuffers owned by the host page, plus the
++	C entry points the host page calls. No transport here: WebRTC, WebSocket or
++	an in-page hub live on the JS side and only read and write the mailbox.
++
++	Copyright (C) 2026 John R Reeves III
++	SPDX-License-Identifier: GPL-2.0-or-later
++
++	This program is free software: you can redistribute it and/or modify
++	it under the terms of the GNU General Public License as published by
++	the Free Software Foundation, either version 2 of the License, or
++	(at your option) any later version.
++
++	This program is distributed in the hope that it will be useful,
++	but WITHOUT ANY WARRANTY; without even the implied warranty of
++	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++	GNU General Public License for more details.
++
++	JS contract (host page or worker, before retro_load_game()):
++
++	  Module.linkbus = {
++	    mailbox: SharedArrayBuffer(MailboxLayout::totalBytes),   // ring, one per seat
++	    cabinet: SharedArrayBuffer(MultiboardSabLayout::totalBytes), // master pair
++	    post: function (msg) { ... },   // optional; default self.postMessage
++	  };
++	  Module._linkbus_install_mailbox(slotId, slotCount, edition, sessionTag, waitMs);
++	  Module._linkbus_install_sab_multiboard();   // master pair only
++
++	  Messages posted by the core:
++	    { type: 'linkbus-tx', seq }                       after each slot frame
++	    { type: 'linkbus-start-partners', boardId, slaves } master, first sync
++
++	The transport writes an assembled frame into RX buffer (latestIndex + 1) % 3,
++	stores its length, stores latestIndex, then Atomics.add(seq, 1) and
++	Atomics.notify(seq). The byte-exact reference is the buffer io in
++	linkbus.cpp (makeBufferMailboxIo, mailboxDeliver, mailboxReadTx).
++
++	Host loop pacing (CLAIM_FAIRNESS R3), once per host frame:
++	    n = Module._linkbus_pacer_frames();
++	    for (i = 0; i < n; i++) { retro_run(); Module._linkbus_pacer_frame_run(); }
++*/
++#ifdef __EMSCRIPTEN__
++
++#include "linkbus.h"
++
++#include <emscripten.h>
++#include <memory>
++
++// ---------------------------------------------------------------------------
++// JS imports: ring mailbox
++// ---------------------------------------------------------------------------
++
++EM_JS(int, lb_mb_pull, (unsigned char *dst, int capacity, unsigned *seqOut,
++		int headerBytes, int bufferBytes), {
++	var lb = Module.linkbus;
++	if (!lb || !lb.mailbox) { HEAPU32[seqOut >> 2] = 0; return 0; }
++	var i32 = lb._mbI32 || (lb._mbI32 = new Int32Array(lb.mailbox, 0, headerBytes >> 2));
++	for (var attempt = 0; attempt < 3; attempt++) {
++		var seq = Atomics.load(i32, 0) >>> 0;
++		if (seq === 0) { HEAPU32[seqOut >> 2] = 0; return 0; }
++		var idx = (Atomics.load(i32, 1) >>> 0) % 3;
++		var len = Math.min(Atomics.load(i32, 4 + idx) >>> 0, bufferBytes);
++		HEAPU8.set(new Uint8Array(lb.mailbox, headerBytes + bufferBytes * idx, Math.min(len, capacity)), dst);
++		// Triple buffer: the copy is torn only if the writer lapped us twice.
++		if (((Atomics.load(i32, 0) >>> 0) - seq) < 2) {
++			HEAPU32[seqOut >> 2] = seq;
++			return len;
++		}
++	}
++	HEAPU32[seqOut >> 2] = 0;
++	return 0;
++});
++
++EM_JS(void, lb_mb_wait, (unsigned seenSeq, int ms, int headerBytes), {
++	var lb = Module.linkbus;
++	if (!lb || !lb.mailbox || ms <= 0) return;
++	var i32 = lb._mbI32 || (lb._mbI32 = new Int32Array(lb.mailbox, 0, headerBytes >> 2));
++	try {
++		Atomics.wait(i32, 0, seenSeq | 0, ms);
++	} catch (e) {
++		// Atomics.wait is not allowed on the main thread: do not block.
++	}
++});
++
++EM_JS(void, lb_mb_push, (const unsigned char *src, int length, int txOffset, int headerBytes), {
++	var lb = Module.linkbus;
++	if (!lb || !lb.mailbox) return;
++	var i32 = lb._mbI32 || (lb._mbI32 = new Int32Array(lb.mailbox, 0, headerBytes >> 2));
++	new Uint8Array(lb.mailbox, txOffset, length).set(HEAPU8.subarray(src, src + length));
++	Atomics.store(i32, 7, length);
++	var seq = Atomics.add(i32, 3, 1) + 1;
++	Atomics.notify(i32, 3);
++	var msg = { type: 'linkbus-tx', seq: seq };
++	if (lb.post) lb.post(msg);
++	else if (typeof postMessage === 'function' && typeof window === 'undefined') postMessage(msg);
++});
++
++EM_JS(int, lb_mb_error, (int headerBytes), {
++	var lb = Module.linkbus;
++	if (!lb || !lb.mailbox) return 1;
++	var i32 = lb._mbI32 || (lb._mbI32 = new Int32Array(lb.mailbox, 0, headerBytes >> 2));
++	return Atomics.load(i32, 2) !== 0 ? 1 : 0;
++});
++
++// ---------------------------------------------------------------------------
++// JS imports: multiboard cabinet
++// ---------------------------------------------------------------------------
++
++EM_JS(int, lb_cab_ok, (), {
++	var lb = Module.linkbus;
++	return lb && lb.cabinet ? 1 : 0;
++});
++
++EM_JS(int, lb_cab_hdr, (int op, int index, int value), {
++	// op 0 load, 1 store, 2 or, 3 and (returns new value for 2, 3)
++	var lb = Module.linkbus;
++	var i32 = lb._cabI32 || (lb._cabI32 = new Int32Array(lb.cabinet, 0, 16));
++	switch (op) {
++	case 0: return Atomics.load(i32, index);
++	case 1: Atomics.store(i32, index, value); return value;
++	case 2: return Atomics.or(i32, index, value) | value;
++	case 3: return Atomics.and(i32, index, value) & value;
++	}
++	return 0;
++});
++
++EM_JS(int, lb_cab_read16, (unsigned word, int dataOffset), {
++	var lb = Module.linkbus;
++	var u16 = lb._cabU16 || (lb._cabU16 = new Uint16Array(lb.cabinet, dataOffset));
++	return u16[word];
++});
++
++EM_JS(void, lb_cab_write16, (unsigned word, int value, int dataOffset), {
++	var lb = Module.linkbus;
++	var u16 = lb._cabU16 || (lb._cabU16 = new Uint16Array(lb.cabinet, dataOffset));
++	u16[word] = value;
++});
++
++EM_JS(void, lb_cab_copy_out, (unsigned word, void *dst, int bytes, int dataOffset), {
++	var lb = Module.linkbus;
++	HEAPU8.set(new Uint8Array(lb.cabinet, dataOffset + word * 2, bytes), dst);
++});
++
++// Generation barrier; returns 0 ok, 1 timeout, 2 exit (slave).
++EM_JS(int, lb_cab_barrier, (int boardId, int timeoutMs), {
++	var lb = Module.linkbus;
++	var i32 = lb._cabI32 || (lb._cabI32 = new Int32Array(lb.cabinet, 0, 16));
++	if (boardId !== 0 && Atomics.load(i32, 1) !== 0) return 2;
++	var g = Atomics.load(i32, 2);
++	var bit = 1 << boardId;
++	var arrived = Atomics.or(i32, 3, bit) | bit;
++	var mask = Atomics.load(i32, 4);
++	if ((arrived & mask) === mask) {
++		Atomics.store(i32, 3, 0);
++		Atomics.add(i32, 2, 1);
++		Atomics.notify(i32, 2);
++		return 0;
++	}
++	var r;
++	try {
++		r = Atomics.wait(i32, 2, g, timeoutMs);
++	} catch (e) {
++		r = 'timed-out';	// main thread: cannot block
++	}
++	if (boardId !== 0 && Atomics.load(i32, 1) !== 0) return 2;
++	return r === 'timed-out' ? 1 : 0;
++});
++
++EM_JS(void, lb_cab_start_partners, (int boardId, int slaves), {
++	var lb = Module.linkbus;
++	var msg = { type: 'linkbus-start-partners', boardId: boardId, slaves: slaves };
++	if (lb && lb.post) lb.post(msg);
++	else if (typeof postMessage === 'function' && typeof window === 'undefined') postMessage(msg);
++});
++
++EM_JS(void, lb_cab_notify, (), {
++	var lb = Module.linkbus;
++	var i32 = lb._cabI32 || (lb._cabI32 = new Int32Array(lb.cabinet, 0, 16));
++	Atomics.notify(i32, 2);
++});
++
++namespace linkbus
++{
++
++namespace {
++
++class JsMailboxIo : public MailboxIo
++{
++public:
++	u32 pullLatest(u8 *dst, u32 capacity, u32 *seqOut) override {
++		return (u32)lb_mb_pull(dst, (int)capacity, seqOut,
++				(int)MailboxLayout::headerBytes, (int)MailboxLayout::bufferBytes);
++	}
++	void waitSeq(u32 seenSeq, u32 ms) override {
++		lb_mb_wait(seenSeq, (int)ms, (int)MailboxLayout::headerBytes);
++	}
++	void push(const u8 *frame, u32 length) override {
++		lb_mb_push(frame, (int)length, (int)MailboxLayout::txBuffer, (int)MailboxLayout::headerBytes);
++	}
++	bool linkError() override {
++		return lb_mb_error((int)MailboxLayout::headerBytes) != 0;
++	}
++};
++
++// i32 indexes of MultiboardSabLayout
++constexpr int kStatus = MultiboardSabLayout::status / 4;
++constexpr int kExit = MultiboardSabLayout::exit / 4;
++constexpr int kBoardMask = MultiboardSabLayout::boardMask / 4;
++constexpr int kArrived = MultiboardSabLayout::arrived / 4;
++constexpr int kData = (int)MultiboardSabLayout::data;
++
++class SabBoard : public MultiboardBackend
++{
++public:
++	explicit SabBoard(int boardId) : id(boardId)
++	{
++		if (id == 0)
++		{
++			// Native master constructor: fresh shared state, only the master
++			// takes part until startPartners().
++			lb_cab_hdr(1, kStatus, 0);
++			lb_cab_hdr(1, kExit, 0);
++			lb_cab_hdr(1, kArrived, 0);
++			lb_cab_hdr(1, kBoardMask, 1);
++		}
++	}
++
++	int boardId() const override { return id; }
++
++	u16 status() const override { return (u16)lb_cab_hdr(0, kStatus, 0); }
++	void setStatus(u16 v) override { lb_cab_hdr(1, kStatus, v); }
++	void statusOr(u16 bits) override { lb_cab_hdr(2, kStatus, bits); }
++	void statusAnd(u16 bits) override { lb_cab_hdr(3, kStatus, (int)(0xffff0000u | bits)); }
++
++	u16 read16(u32 i) const override { return (u16)lb_cab_read16(i & (kMbDataWords - 1), kData); }
++	void write16(u32 i, u16 v) override { lb_cab_write16(i & (kMbDataWords - 1), v, kData); }
++	u32 read32(u32 i) const override
++	{
++		i &= kMbDataWords - 1;
++		u32 v = read16(i);
++		if (i + 1 < kMbDataWords)
++			v |= (u32)read16(i + 1) << 16;
++		return v;
++	}
++	void write32(u32 i, u32 v) override
++	{
++		i &= kMbDataWords - 1;
++		write16(i, (u16)v);
++		if (i + 1 < kMbDataWords)
++			write16(i + 1, (u16)(v >> 16));
++	}
++	void copyOut(u32 i, void *dst, u32 bytes) const override
++	{
++		i &= kMbDataWords - 1;
++		if (bytes > (kMbDataWords - i) * 2)
++			bytes = (kMbDataWords - i) * 2;
++		lb_cab_copy_out(i, dst, (int)bytes, kData);
++	}
++
++	BarrierResult barrier(u32 timeoutMs) override
++	{
++		switch (lb_cab_barrier(id, (int)timeoutMs))
++		{
++		case 0: return BarrierResult::Ok;
++		case 2: return BarrierResult::Exit;
++		default: return BarrierResult::Timeout;
++		}
++	}
++
++	void requestExit() override
++	{
++		lb_cab_hdr(1, kExit, 1);
++		lb_cab_notify();
++	}
++
++	void startPartners(int slaves) override
++	{
++		if (slaves < 0) slaves = 0;
++		if (slaves > kMbMaxBoards - 1) slaves = kMbMaxBoards - 1;
++		lb_cab_hdr(1, kArrived, 0);
++		lb_cab_hdr(1, kBoardMask, (1 << (slaves + 1)) - 1);
++		lb_cab_start_partners(id, slaves);
++	}
++
++private:
++	int id;
++};
++
++FramePacer pacer;
++
++} // namespace
++
++std::unique_ptr<MultiboardBackend> makeSabMultiboardBackend(int boardId)
++{
++	if (!lb_cab_ok())
++		return nullptr;
++	return std::make_unique<SabBoard>(boardId);
++}
++
++} // namespace linkbus
++
++using namespace linkbus;
++
++extern "C" {
++
++// Install the mailbox ring backend. Returns 0 on success.
++EMSCRIPTEN_KEEPALIVE int linkbus_install_mailbox(int slotId, int slotCount, int edition,
++		unsigned sessionTag, unsigned waitMs)
++{
++	if (slotCount < 2 || slotCount > kMaxRingNodes || slotId < 0 || slotId >= slotCount)
++		return 1;
++	if (edition != (int)Edition::A && edition != (int)Edition::B)
++		return 2;
++	MailboxConfig cfg;
++	cfg.role.slotId = slotId;
++	cfg.role.slotCount = slotCount;
++	cfg.role.edition = (Edition)edition;
++	cfg.sessionTag = sessionTag;
++	cfg.waitMs = waitMs;
++	setRingBackend(makeMailboxRingBackend(cfg, std::make_unique<JsMailboxIo>()));
++	pacer.reset();
++	return 0;
++}
++
++EMSCRIPTEN_KEEPALIVE void linkbus_uninstall_ring() {
++	setRingBackend(nullptr);
++}
++
++EMSCRIPTEN_KEEPALIVE void linkbus_install_sab_multiboard() {
++	setMultiboardFactory([](int boardId) { return makeSabMultiboardBackend(boardId); });
++}
++
++// Pacing, once per host frame (see the file header).
++EMSCRIPTEN_KEEPALIVE int linkbus_pacer_frames()
++{
++	u32 tick;
++	if (ringBackend() != nullptr && ringBackend()->peekHubTick(&tick))
++		pacer.observeHubTick(tick);
++	return (int)pacer.framesToRun();
++}
++
++EMSCRIPTEN_KEEPALIVE void linkbus_pacer_frame_run() {
++	pacer.onFrameRun();
++}
++
++// Copies ring stats (7 u32) and pacer stats (4 u32) to out. Returns 0 if no ring.
++EMSCRIPTEN_KEEPALIVE int linkbus_stats(u32 *out)
++{
++	RingBackend *ring = ringBackend();
++	if (ring == nullptr)
++		return 0;
++	RingBackend::Stats s = ring->stats();
++	FramePacer::Stats p = pacer.stats();
++	const u32 v[] = { s.published, s.taken, s.stale, s.dropped, s.badEdition, s.badSize, s.badHeader,
++			p.held, p.forced, p.caughtUp, p.droppedCredit };
++	for (u32 i = 0; i < sizeof(v) / sizeof(v[0]); i++)
++		out[i] = v[i];
++	return 1;
++}
++
++} // extern "C"
++
++#endif // __EMSCRIPTEN__
+diff --git a/core/network/net_handshake.cpp b/core/network/net_handshake.cpp
+index 84aae4a23..11f20efdd 100644
+--- a/core/network/net_handshake.cpp
++++ b/core/network/net_handshake.cpp
+@@ -20,6 +20,7 @@
+ #include "cfg/option.h"
+ #include "ggpo.h"
+ #include "naomi_network.h"
++#include "linkbus.h"
+ //#include "net_serial_maxspeed.h"
+ #include "null_modem.h"
+ #include "hw/naomi/naomi_flashrom.h"
+@@ -61,12 +62,41 @@ public:
+ 	}
+ };
+ 
++// LinkBus (PLAN_V2 2.10, LINKBUS.md 3.5): the host has already joined the hub
++// and installed a ring backend before the game was loaded. The role is known,
++// so the EEPROM link bytes are set synchronously, as startNetwork() does on
++// desktop once the UDP ring is up.
++class LinkBusHandshake : public NetworkHandshake
++{
++public:
++	LinkBusHandshake()
++	{
++		const linkbus::RingRole role = linkbus::ringBackend()->role();
++		SetNaomiNetworkConfig(role.slotId, role.slotCount);
++	}
++
++	std::future<bool> start() override {
++		std::promise<bool> promise;
++		promise.set_value(true);
++		return promise.get_future();
++	}
++
++	void stop() override {
++	}
++
++	bool canStartNow() override { return false; }
++	void startNow() override {}
++};
++
+ void NetworkHandshake::init()
+ {
+ 	if (settings.platform.isArcade())
+ 		SetNaomiNetworkConfig(-1, 0);
+ 
+-	if (config::GGPOEnable) {
++	if (settings.platform.isNaomi() && linkbus::ringBackendInstalled()) {
++		instance = new LinkBusHandshake();
++	}
++	else if (config::GGPOEnable) {
+ 		instance = new GGPONetworkHandshake();
+ 	}
+ 	else if (NaomiNetworkSupported()) {
+diff --git a/tests/linkbus/linkbus_test.cpp b/tests/linkbus/linkbus_test.cpp
+new file mode 100644
+index 000000000..2157c384d
+--- /dev/null
++++ b/tests/linkbus/linkbus_test.cpp
+@@ -0,0 +1,706 @@
++/*
++	LinkBus unit tests (standalone, no gtest, no Flycast).
++	Build and run: tests/linkbus/run-tests.sh (emcc, then node).
++
++	Copyright (C) 2026 John R Reeves III
++	SPDX-License-Identifier: GPL-2.0-or-later
++
++	All bytes used here are synthetic. No ROM data.
++*/
++#include "network/linkbus.h"
++
++#include <cstdio>
++#include <string>
++#include <vector>
++
++using namespace linkbus;
++
++static int failures = 0;
++static int checks = 0;
++static const char *currentTest = "";
++
++#define CHECK(cond) do { checks++; if (!(cond)) { failures++; \
++	std::printf("  FAIL %s:%d [%s] %s\n", __FILE__, __LINE__, currentTest, #cond); } } while (0)
++#define CHECK_EQ(a, b) do { checks++; auto _a = (a); auto _b = (b); if (!(_a == _b)) { failures++; \
++	std::printf("  FAIL %s:%d [%s] %s == %s (%lld vs %lld)\n", __FILE__, __LINE__, currentTest, #a, #b, \
++		(long long)_a, (long long)_b); } } while (0)
++
++#define TEST(name) static void name(); static Registrar reg_##name(#name, name); static void name()
++
++struct Registrar;
++static std::vector<std::pair<const char *, void (*)()>>& registry() {
++	static std::vector<std::pair<const char *, void (*)()>> r;
++	return r;
++}
++struct Registrar {
++	Registrar(const char *n, void (*f)()) { registry().emplace_back(n, f); }
++};
++
++// Synthetic slot content: byte i of node `node`'s slot at generation g.
++static u8 pat(int node, u32 i, u32 g = 0) { return (u8)(0x10 * (node + 1) + (i * 7) + g * 31); }
++
++static std::vector<u8> slotOf(int node, u32 S, u32 g = 0)
++{
++	std::vector<u8> v(S);
++	for (u32 i = 0; i < S; i++)
++		v[i] = pat(node, i, g);
++	return v;
++}
++
++static bool slotIs(const u8 *p, int node, u32 S, u32 g = 0)
++{
++	for (u32 i = 0; i < S; i++)
++		if (p[i] != pat(node, i, g))
++			return false;
++	return true;
++}
++
++// ---------------------------------------------------------------------------
++// rxSourceNode
++// ---------------------------------------------------------------------------
++
++TEST(rxSourceNode_known_values)
++{
++	// n = 5, master
++	CHECK_EQ(rxSourceNode(0, 5, 1), 4);
++	CHECK_EQ(rxSourceNode(0, 5, 2), 3);
++	CHECK_EQ(rxSourceNode(0, 5, 4), 1);
++	CHECK_EQ(rxSourceNode(0, 5, 5), 0);		// echo
++	// n = 5, node 2
++	CHECK_EQ(rxSourceNode(2, 5, 1), 1);
++	CHECK_EQ(rxSourceNode(2, 5, 2), 0);
++	CHECK_EQ(rxSourceNode(2, 5, 3), 4);
++	CHECK_EQ(rxSourceNode(2, 5, 4), 3);
++	CHECK_EQ(rxSourceNode(2, 5, 5), 2);
++	// n = 9 (DOC maximum: master + 8)
++	CHECK_EQ(rxSourceNode(8, 9, 1), 7);
++	CHECK_EQ(rxSourceNode(1, 9, 2), 8);
++	CHECK_EQ(rxSlotOffset(0x80, 3), 0x100u + 0x180u);
++	CHECK_EQ(rxRegionSize(0x80, 9), 0x480u);
++}
++
++TEST(rxSourceNode_permutation_and_echo)
++{
++	for (int n = 2; n <= kMaxRingNodes; n++)
++		for (int own = 0; own < n; own++)
++		{
++			std::vector<int> seen(n, 0);
++			for (int k = 1; k <= n; k++)
++			{
++				int s = rxSourceNode(own, n, k);
++				CHECK(s >= 0 && s < n);
++				if (s >= 0 && s < n)
++					seen[s]++;
++			}
++			for (int i = 0; i < n; i++)
++				CHECK_EQ(seen[i], 1);
++			CHECK_EQ(rxSourceNode(own, n, n), own);
++			CHECK_EQ(rxSourceNode(own, n, 1), (own + n - 1) % n);
++		}
++}
++
++// Simulates the native UDP ring at 8412d3d8a: every vblank each node sends
++// comm_ram[0x100 .. 0x100 + n*S) to the next node, which copies it to
++// comm_ram[0x100 + S]. After enough laps slot k must hold node
++// rxSourceNode(own, n, k)'s own slot.
++TEST(rxSourceNode_matches_native_ring_forwarding)
++{
++	for (int n = 2; n <= 9; n++)
++	{
++		const u32 S = 6;
++		std::vector<std::vector<u8>> ram(n, std::vector<u8>(S * (n + 1), 0));
++		for (int i = 0; i < n; i++)
++		{
++			auto own = slotOf(i, S);
++			std::copy(own.begin(), own.end(), ram[i].begin());
++		}
++		for (int step = 0; step < 2 * n + 2; step++)
++		{
++			// Node order of one vblank does not matter for the steady state;
++			// send everyone's buffer from a snapshot (simultaneous hop).
++			auto snap = ram;
++			for (int i = 0; i < n; i++)
++			{
++				int next = (i + 1) % n;
++				std::copy(snap[i].begin(), snap[i].begin() + S * n, ram[next].begin() + S);
++			}
++		}
++		for (int own = 0; own < n; own++)
++			for (int k = 1; k <= n; k++)
++				CHECK(slotIs(&ram[own][S * k], rxSourceNode(own, n, k), S));
++	}
++}
++
++// ---------------------------------------------------------------------------
++// assembleRx
++// ---------------------------------------------------------------------------
++
++TEST(assembleRx_ordering)
++{
++	const int n = 6;
++	const u32 S = 8;
++	std::vector<std::vector<u8>> slots;
++	for (int i = 0; i < n; i++)
++		slots.push_back(slotOf(i, S));
++	std::vector<const u8 *> latest;
++	for (auto& s : slots)
++		latest.push_back(s.data());
++	for (int own = 0; own < n; own++)
++	{
++		std::vector<u8> rx(S * n, 0);
++		assembleRx(latest.data(), n, own, S, rx.data());
++		for (int k = 1; k <= n; k++)
++			CHECK(slotIs(&rx[S * (k - 1)], rxSourceNode(own, n, k), S));
++		// Echo slot (k = n) is the own slot.
++		CHECK(slotIs(&rx[S * (n - 1)], own, S));
++	}
++}
++
++TEST(assembleRx_missing_node_leaves_slot_unchanged)
++{
++	const int n = 5;
++	const u32 S = 4;
++	std::vector<std::vector<u8>> slots;
++	for (int i = 0; i < n; i++)
++		slots.push_back(slotOf(i, S));
++	std::vector<const u8 *> latest;
++	for (auto& s : slots)
++		latest.push_back(s.data());
++	latest[3] = nullptr;
++	const int own = 1;
++	std::vector<u8> rx(S * n, 0xEE);
++	assembleRx(latest.data(), n, own, S, rx.data());
++	for (int k = 1; k <= n; k++)
++	{
++		int src = rxSourceNode(own, n, k);
++		if (src == 3)
++		{
++			for (u32 i = 0; i < S; i++)
++				CHECK_EQ(rx[S * (k - 1) + i], 0xEE);
++		}
++		else
++			CHECK(slotIs(&rx[S * (k - 1)], src, S));
++	}
++}
++
++// ---------------------------------------------------------------------------
++// Edition and header refusal
++// ---------------------------------------------------------------------------
++
++static std::vector<u8> makeSlotFrame(int node, int n, u32 S, Edition ed, u32 session, u16 pn, u32 g = 0)
++{
++	SlotFrameHeader h{};
++	h.magic = kSlotMagic;
++	h.version = kWireVersion;
++	h.edition = (u8)ed;
++	h.nodeId = (u8)node;
++	h.slotCount = (u8)n;
++	h.slotSize = (u16)S;
++	h.packetNumber = pn;
++	h.sessionTag = session;
++	std::vector<u8> f(sizeof(h) + S);
++	std::memcpy(f.data(), &h, sizeof(h));
++	auto s = slotOf(node, S, g);
++	std::memcpy(f.data() + sizeof(h), s.data(), S);
++	return f;
++}
++
++static std::vector<u8> makeAssembled(int target, int n, u32 S, Edition ed, u32 session, u32 tick, u16 prev, u32 g = 0)
++{
++	AssembledFrameHeader h{};
++	h.magic = kAssembledMagic;
++	h.version = kWireVersion;
++	h.edition = (u8)ed;
++	h.targetNode = (u8)target;
++	h.slotCount = (u8)n;
++	h.slotSize = (u16)S;
++	h.prevPacketNumber = prev;
++	h.hubTick = tick;
++	h.releaseFrame = tick;
++	h.sessionTag = session;
++	std::vector<u8> f(sizeof(h) + S * n);
++	std::memcpy(f.data(), &h, sizeof(h));
++	for (int k = 1; k <= n; k++)
++	{
++		auto s = slotOf(rxSourceNode(target, n, k), S, g);
++		std::memcpy(f.data() + sizeof(h) + S * (k - 1), s.data(), S);
++	}
++	return f;
++}
++
++TEST(edition_tag_refusal_wire_checks)
++{
++	WireExpect e;
++	e.edition = Edition::A;
++	e.sessionTag = 77;
++	e.slotCount = 5;
++	e.slotSize = 16;
++	auto ok = makeSlotFrame(2, 5, 16, Edition::A, 77, 1);
++	CHECK(checkSlotFrame(ok.data(), (u32)ok.size(), e, nullptr) == FrameCheck::Ok);
++	auto b = makeSlotFrame(2, 5, 16, Edition::B, 77, 1);
++	CHECK(checkSlotFrame(b.data(), (u32)b.size(), e, nullptr) == FrameCheck::BadEdition);
++	auto unk = makeSlotFrame(2, 5, 16, Edition::Unknown, 77, 1);
++	CHECK(checkSlotFrame(unk.data(), (u32)unk.size(), e, nullptr) == FrameCheck::BadEdition);
++	auto sess = makeSlotFrame(2, 5, 16, Edition::A, 78, 1);
++	CHECK(checkSlotFrame(sess.data(), (u32)sess.size(), e, nullptr) == FrameCheck::BadHeader);
++	auto size = makeSlotFrame(2, 5, 32, Edition::A, 77, 1);
++	CHECK(checkSlotFrame(size.data(), (u32)size.size(), e, nullptr) == FrameCheck::BadSize);
++	CHECK(checkSlotFrame(ok.data(), (u32)ok.size() - 1, e, nullptr) == FrameCheck::BadSize);
++	auto node = makeSlotFrame(5, 5, 16, Edition::A, 77, 1);
++	CHECK(checkSlotFrame(node.data(), (u32)node.size(), e, nullptr) == FrameCheck::BadHeader);
++
++	e.targetNode = 3;
++	auto a = makeAssembled(3, 5, 16, Edition::A, 77, 10, 4);
++	CHECK(checkAssembledFrame(a.data(), (u32)a.size(), e, nullptr) == FrameCheck::Ok);
++	auto ab = makeAssembled(3, 5, 16, Edition::B, 77, 10, 4);
++	CHECK(checkAssembledFrame(ab.data(), (u32)ab.size(), e, nullptr) == FrameCheck::BadEdition);
++	auto at = makeAssembled(2, 5, 16, Edition::A, 77, 10, 4);
++	CHECK(checkAssembledFrame(at.data(), (u32)at.size(), e, nullptr) == FrameCheck::BadHeader);
++	auto an = makeAssembled(3, 6, 16, Edition::A, 77, 10, 4);
++	CHECK(checkAssembledFrame(an.data(), (u32)an.size(), e, nullptr) == FrameCheck::BadSize);
++}
++
++TEST(edition_tag_refusal_hub)
++{
++	const int n = 5;
++	const u32 S = 12;
++	InMemoryHub hub(n, Edition::A, 0, 99);
++	std::vector<std::unique_ptr<RingBackend>> seats;
++	for (int i = 0; i < n; i++)
++		seats.push_back(hub.attach(i, i == 3 ? Edition::B : Edition::A));
++	for (int i = 0; i < n; i++)
++	{
++		auto s = slotOf(i, S);
++		CHECK(seats[i]->publish(s.data(), S, n, (u16)(100 + i)));
++	}
++	CHECK_EQ(hub.stats().badEdition, 1u);
++	CHECK_EQ(hub.stats().accepted, 4u);
++	CHECK_EQ(seats[3]->stats().badEdition, 1u);
++	hub.tick();
++	// Seat 1: node 3's slot never arrived. The hub's view of it is still the
++	// start-up zero (native comm RAM also starts zeroed), and stays so.
++	std::vector<u8> rx(S * n, 0xEE);
++	TakeResult r = seats[1]->take(rx.data(), S, n, 0);
++	CHECK(r.fresh);
++	for (int k = 1; k <= n; k++)
++	{
++		int src = rxSourceNode(1, n, k);
++		if (src == 3)
++			CHECK_EQ(rx[S * (k - 1)], 0x00);
++		else
++			CHECK(slotIs(&rx[S * (k - 1)], src, S));
++	}
++	// Seat 3 (edition B) refuses the hub's edition A frame.
++	std::vector<u8> rx3(S * n, 0x55);
++	TakeResult r3 = seats[3]->take(rx3.data(), S, n, 0);
++	CHECK(!r3.fresh);
++	CHECK(!r3.error);
++	CHECK_EQ(seats[3]->stats().badEdition, 2u);
++	CHECK_EQ(rx3[0], 0x55);
++	// A foreign frame injected on the raw wire is refused too.
++	auto foreign = makeSlotFrame(2, n, S, Edition::B, 99, 7);
++	CHECK(hub.submit(foreign.data(), (u32)foreign.size()) == FrameCheck::BadEdition);
++	CHECK_EQ(hub.stats().badEdition, 2u);
++}
++
++TEST(edition_tag_refusal_mailbox)
++{
++	const int n = 5;
++	const u32 S = 16;
++	std::vector<u8> region(MailboxLayout::totalBytes, 0);
++	MailboxConfig cfg;
++	cfg.role = { 2, n, Edition::A };
++	cfg.sessionTag = 5;
++	auto ring = makeMailboxRingBackend(cfg, makeBufferMailboxIo(region.data()));
++	auto bad = makeAssembled(2, n, S, Edition::B, 5, 1, 0);
++	mailboxDeliver(region.data(), bad.data(), (u32)bad.size());
++	std::vector<u8> rx(S * n, 0x33);
++	TakeResult r = ring->take(rx.data(), S, n, 0);
++	CHECK(!r.fresh);
++	CHECK(!r.error);
++	CHECK_EQ(ring->stats().badEdition, 1u);
++	CHECK_EQ(rx[0], 0x33);
++	// The next good frame is accepted.
++	auto good = makeAssembled(2, n, S, Edition::A, 5, 2, 41);
++	mailboxDeliver(region.data(), good.data(), (u32)good.size());
++	r = ring->take(rx.data(), S, n, 0);
++	CHECK(r.fresh);
++	CHECK_EQ(r.packetNumber, 41);
++	CHECK(slotIs(&rx[0], rxSourceNode(2, n, 1), S));
++}
++
++// ---------------------------------------------------------------------------
++// Stale and missing frames
++// ---------------------------------------------------------------------------
++
++TEST(hub_stale_before_first_frame_and_without_tick)
++{
++	const int n = 5;
++	const u32 S = 8;
++	InMemoryHub hub(n, Edition::A, 0);
++	auto s0 = hub.attach(0);
++	auto s1 = hub.attach(1);
++	CHECK(hub.attach(1) == nullptr);	// seat already taken
++	std::vector<u8> rx(S * n, 0x77);
++	hub.tick();
++	TakeResult r = s1->take(rx.data(), S, n, 0);
++	CHECK(!r.fresh);
++	CHECK(!r.error);
++	CHECK_EQ(s1->stats().stale, 1u);
++	auto d0 = slotOf(0, S);
++	s0->publish(d0.data(), S, n, 10);
++	// Published but no hub tick yet: still stale.
++	r = s1->take(rx.data(), S, n, 0);
++	CHECK(!r.fresh);
++	CHECK_EQ(rx[0], 0x77);
++	hub.tick();
++	r = s1->take(rx.data(), S, n, 0);
++	CHECK(r.fresh);
++	CHECK_EQ(r.packetNumber, 10);		// predecessor of 1 is 0
++	CHECK(slotIs(&rx[0], 0, S));		// k = 1 is node 0
++	CHECK_EQ(rx[S], 0x00);				// k = 2 is node 4: nothing yet, hub start-up zero
++	// Taking again without a new tick: stale, bytes unchanged.
++	std::vector<u8> before = rx;
++	r = s1->take(rx.data(), S, n, 0);
++	CHECK(!r.fresh);
++	CHECK(rx == before);
++	// A tick with no new publish delivers nothing new.
++	hub.tick();
++	r = s1->take(rx.data(), S, n, 0);
++	CHECK(!r.fresh);
++	CHECK_EQ(s1->stats().stale, 4u);
++	CHECK_EQ(s1->stats().taken, 1u);
++}
++
++TEST(hub_missing_node_keeps_old_slot_and_transcnt)
++{
++	const int n = 5;
++	const u32 S = 8;
++	InMemoryHub hub(n, Edition::A, 0);
++	std::vector<std::unique_ptr<RingBackend>> seats;
++	for (int i = 0; i < n; i++)
++		seats.push_back(hub.attach(i));
++	auto publishAll = [&](u32 g, int skip) {
++		for (int i = 0; i < n; i++)
++			if (i != skip)
++			{
++				auto s = slotOf(i, S, g);
++				seats[i]->publish(s.data(), S, n, (u16)(g * 10 + i));
++			}
++	};
++	std::vector<std::vector<u8>> rx(n, std::vector<u8>(S * n, 0));
++	publishAll(1, -1);
++	hub.tick();
++	for (int t = 0; t < n; t++)
++		CHECK(seats[t]->take(rx[t].data(), S, n, 0).fresh);
++	// Node 2 goes missing for generation 2.
++	publishAll(2, 2);
++	hub.tick();
++	for (int t = 0; t < n; t++)
++	{
++		TakeResult r = seats[t]->take(rx[t].data(), S, n, 0);
++		CHECK(r.fresh);
++		const int pred = (t + n - 1) % n;
++		// Seat 3's predecessor is node 2: transcnt stays at generation 1.
++		CHECK_EQ(r.packetNumber, (u16)((pred == 2 ? 1 : 2) * 10 + pred));
++		for (int k = 1; k <= n; k++)
++		{
++			int src = rxSourceNode(t, n, k);
++			CHECK(slotIs(&rx[t][S * (k - 1)], src, S, src == 2 ? 1 : 2));
++		}
++	}
++}
++
++TEST(hub_overwrite_counts_dropped_and_latest_wins)
++{
++	const int n = 3;
++	const u32 S = 4;
++	InMemoryHub hub(n, Edition::A, 0);
++	auto a = hub.attach(0), b = hub.attach(1), c = hub.attach(2);
++	std::vector<u8> rx(S * n, 0);
++	for (u32 g = 1; g <= 3; g++)
++	{
++		auto s = slotOf(0, S, g);
++		a->publish(s.data(), S, n, (u16)g);
++		hub.tick();
++	}
++	TakeResult r = b->take(rx.data(), S, n, 0);
++	CHECK(r.fresh);
++	CHECK_EQ(r.packetNumber, 3);
++	CHECK_EQ(r.hubTick, 3u);
++	CHECK(slotIs(&rx[0], 0, S, 3));
++	CHECK_EQ(b->stats().dropped, 2u);
++	// Two publishes in one tick: the later one wins.
++	auto s4 = slotOf(0, S, 4), s5 = slotOf(0, S, 5);
++	a->publish(s4.data(), S, n, 4);
++	a->publish(s5.data(), S, n, 5);
++	hub.tick();
++	r = b->take(rx.data(), S, n, 0);
++	CHECK(r.fresh);
++	CHECK_EQ(r.packetNumber, 5);
++	CHECK(slotIs(&rx[0], 0, S, 5));
++}
++
++TEST(hub_equal_delay)
++{
++	const int n = 4;
++	const u32 S = 4;
++	const u32 L = 2;
++	InMemoryHub hub(n, Edition::A, L);
++	std::vector<std::unique_ptr<RingBackend>> seats;
++	for (int i = 0; i < n; i++)
++		seats.push_back(hub.attach(i));
++	std::vector<u8> rx(S * n, 0);
++	auto s = slotOf(0, S, 1);
++	seats[0]->publish(s.data(), S, n, 1);		// stamped at tick 0
++	for (u32 t = 1; t <= L; t++)
++	{
++		hub.tick();
++		for (int i = 1; i < n; i++)
++			CHECK(!seats[i]->take(rx.data(), S, n, 0).fresh);
++	}
++	hub.tick();		// tick L + 1: visible to every seat at once
++	for (int i = 0; i < n; i++)
++		CHECK(seats[i]->take(rx.data(), S, n, 0).fresh);
++}
++
++TEST(hub_fail_is_error)
++{
++	InMemoryHub hub(3, Edition::A, 0);
++	auto a = hub.attach(0);
++	std::vector<u8> rx(12, 0);
++	hub.fail();
++	TakeResult r = a->take(rx.data(), 4, 3, 0);
++	CHECK(r.error);
++	CHECK(!r.fresh);
++}
++
++TEST(mailbox_stale_dropped_replay_error_and_publish)
++{
++	const int n = 5;
++	const u32 S = 16;
++	std::vector<u8> region(MailboxLayout::totalBytes, 0);
++	MailboxConfig cfg;
++	cfg.role = { 1, n, Edition::B };
++	cfg.sessionTag = 1234;
++	auto ring = makeMailboxRingBackend(cfg, makeBufferMailboxIo(region.data()));
++	std::vector<u8> rx(S * n, 0x11);
++	CHECK(!ring->take(rx.data(), S, n, 0).fresh);
++	CHECK(!ring->take(rx.data(), S, n, 50).fresh);		// wait with nothing: still stale
++	CHECK_EQ(ring->stats().stale, 2u);
++	u32 tick = 0;
++	CHECK(!ring->peekHubTick(&tick));
++
++	for (u32 g = 1; g <= 3; g++)
++	{
++		auto f = makeAssembled(1, n, S, Edition::B, 1234, 100 + g, (u16)(g * 3), g);
++		mailboxDeliver(region.data(), f.data(), (u32)f.size());
++	}
++	CHECK(ring->peekHubTick(&tick));
++	CHECK_EQ(tick, 103u);
++	TakeResult r = ring->take(rx.data(), S, n, 0);
++	CHECK(r.fresh);
++	CHECK_EQ(r.packetNumber, 9);
++	CHECK_EQ(r.hubTick, 103u);
++	CHECK_EQ(ring->stats().dropped, 2u);
++	for (int k = 1; k <= n; k++)
++		CHECK(slotIs(&rx[S * (k - 1)], rxSourceNode(1, n, k), S, 3));
++	CHECK(!ring->take(rx.data(), S, n, 0).fresh);
++	// Replay of an older hub tick is refused (stale), bytes untouched.
++	std::vector<u8> before = rx;
++	auto old = makeAssembled(1, n, S, Edition::B, 1234, 102, 6, 9);
++	mailboxDeliver(region.data(), old.data(), (u32)old.size());
++	CHECK(!ring->take(rx.data(), S, n, 0).fresh);
++	CHECK(rx == before);
++	// Publish writes one slot frame for the hub.
++	std::vector<u8> tx(S * n);
++	for (u32 i = 0; i < S * n; i++)
++		tx[i] = (u8)i;
++	CHECK(ring->publish(tx.data(), S, n, 0x4321));
++	std::vector<u8> out(sizeof(SlotFrameHeader) + kMaxPayload);
++	u32 txSeq = 0;
++	u32 len = mailboxReadTx(region.data(), out.data(), (u32)out.size(), &txSeq);
++	CHECK_EQ(txSeq, 1u);
++	CHECK_EQ(len, (u32)sizeof(SlotFrameHeader) + S);
++	WireExpect e;
++	e.edition = Edition::B;
++	e.sessionTag = 1234;
++	e.slotCount = n;
++	e.slotSize = S;
++	SlotFrameHeader h;
++	CHECK(checkSlotFrame(out.data(), len, e, &h) == FrameCheck::Ok);
++	CHECK_EQ(h.nodeId, 1);
++	CHECK_EQ(h.packetNumber, 0x4321);
++	CHECK_EQ(out[sizeof(SlotFrameHeader) + S - 1], (u8)(S - 1));
++	// Link loss.
++	mailboxSetError(region.data(), true);
++	CHECK(ring->take(rx.data(), S, n, 0).error);
++}
++
++// End to end: every seat runs the NaomiM3Comm::vblank order (take, then
++// publish) with the hub ticking once per frame, L = 1.
++TEST(hub_vblank_loop_steady_state)
++{
++	const int n = 5;
++	const u32 S = 10;
++	InMemoryHub hub(n, Edition::A, 1);
++	std::vector<std::unique_ptr<RingBackend>> seats;
++	for (int i = 0; i < n; i++)
++		seats.push_back(hub.attach(i));
++	struct Board { std::vector<u8> comm; u16 transcnt = 0; u16 packet = 0; };
++	std::vector<Board> boards(n);
++	for (auto& b : boards)
++		b.comm.assign(S * (n + 1), 0);
++	for (u32 frame = 1; frame <= 20; frame++)
++	{
++		for (int i = 0; i < n; i++)
++		{
++			Board& b = boards[i];
++			auto own = slotOf(i, S, frame);
++			std::copy(own.begin(), own.end(), b.comm.begin());
++			TakeResult r = seats[i]->take(&b.comm[S], S, n, 0);
++			CHECK(!r.error);
++			if (r.fresh)
++				b.transcnt = r.packetNumber;
++			seats[i]->publish(&b.comm[0], S, n, b.packet++);
++		}
++		hub.tick();
++	}
++	// Frame 20's take saw the hub state after tick 19, which with L = 1
++	// carries the slots published in frame 18 (stamp 17, visible at 19).
++	for (int t = 0; t < n; t++)
++	{
++		for (int k = 1; k <= n; k++)
++			CHECK(slotIs(&boards[t].comm[S * k], rxSourceNode(t, n, k), S, 18));
++		CHECK_EQ(boards[t].transcnt, 17);
++		CHECK_EQ(seats[t]->stats().dropped, 0u);
++	}
++}
++
++// ---------------------------------------------------------------------------
++// FramePacer
++// ---------------------------------------------------------------------------
++
++TEST(pacer_lockstep_hold_force_catchup)
++{
++	FramePacer::Config c;
++	c.maxHoldFrames = 3;
++	c.maxCatchUp = 2;
++	c.maxBacklog = 4;
++	FramePacer p(c);
++	CHECK_EQ(p.framesToRun(), 1u);		// no tick yet: free run
++	p.onFrameRun();
++	p.reset();
++	// Lockstep: one tick per host frame gives one local frame.
++	u32 tick = 50;
++	for (int i = 0; i < 10; i++)
++	{
++		p.observeHubTick(tick++);
++		u32 k = p.framesToRun();
++		CHECK_EQ(k, 1u);
++		for (u32 j = 0; j < k; j++)
++			p.onFrameRun();
++	}
++	CHECK_EQ(p.stats().held, 0u);
++	// Hub stalls: hold maxHoldFrames host frames, then force one.
++	for (int i = 0; i < 3; i++)
++	{
++		p.observeHubTick(tick - 1);		// same tick again
++		CHECK_EQ(p.framesToRun(), 0u);
++	}
++	p.observeHubTick(tick - 1);
++	CHECK_EQ(p.framesToRun(), 1u);
++	p.onFrameRun();
++	CHECK_EQ(p.stats().held, 3u);
++	CHECK_EQ(p.stats().forced, 1u);
++	CHECK_EQ(p.credit(), -1);
++	// Hub bursts 4 ticks: the forced frame is repaid, then catch up 2 + 1.
++	tick += 4;
++	p.observeHubTick(tick - 1);
++	CHECK_EQ(p.credit(), 3);
++	u32 k = p.framesToRun();
++	CHECK_EQ(k, 2u);
++	for (u32 j = 0; j < k; j++) p.onFrameRun();
++	k = p.framesToRun();
++	CHECK_EQ(k, 1u);
++	p.onFrameRun();
++	CHECK_EQ(p.credit(), 0);
++	// Huge burst is clamped to the backlog.
++	tick += 20;
++	p.observeHubTick(tick);
++	CHECK_EQ(p.credit(), 4);
++	CHECK(p.stats().droppedCredit > 0u);
++	// Older tick (reordered) adds nothing.
++	p.observeHubTick(tick - 5);
++	CHECK_EQ(p.credit(), 4);
++}
++
++TEST(pacer_with_hub_peek)
++{
++	InMemoryHub hub(3, Edition::A, 0);
++	auto a = hub.attach(0), b = hub.attach(1), c = hub.attach(2);
++	FramePacer p;
++	u32 t;
++	CHECK(!b->peekHubTick(&t));
++	auto s = slotOf(0, 4);
++	a->publish(s.data(), 4, 3, 1);
++	hub.tick();
++	CHECK(b->peekHubTick(&t));
++	CHECK_EQ(t, 1u);
++	p.observeHubTick(t);
++	CHECK_EQ(p.framesToRun(), 1u);
++}
++
++// ---------------------------------------------------------------------------
++// Multiboard in-memory cabinet
++// ---------------------------------------------------------------------------
++
++TEST(cabinet_barrier_and_exit)
++{
++	InMemoryCabinet cab;
++	std::vector<int> started;
++	cab.partnerStarter = [&](int id) { started.push_back(id); };
++	auto master = cab.attach(0);
++	auto slave = cab.attach(1);
++	// Before startPartners only the master takes part.
++	CHECK(master->barrier(0) == BarrierResult::Ok);
++	master->startPartners(1);
++	CHECK_EQ(started.size(), (size_t)1);
++	CHECK_EQ(started.empty() ? -1 : started[0], 1);
++	// Master arrives first and times out (single thread), slave completes.
++	CHECK(master->barrier(0) == BarrierResult::Timeout);
++	CHECK(slave->barrier(0) == BarrierResult::Ok);
++	// Both arrive again in the other order.
++	CHECK(slave->barrier(0) == BarrierResult::Timeout);
++	CHECK(master->barrier(0) == BarrierResult::Ok);
++	// Status and bank are shared.
++	master->setStatus(0x0003);
++	slave->statusOr(0x10 << 1);
++	CHECK_EQ(master->status(), 0x23);
++	slave->statusAnd((u16)~(0x10 << 1));
++	CHECK_EQ(master->status(), 0x03);
++	master->write32(0x100, 0xAABBCCDD);
++	CHECK_EQ(slave->read16(0x100), 0xCCDD);
++	CHECK_EQ(slave->read16(0x101), 0xAABB);
++	CHECK_EQ(slave->read32(0x100), 0xAABBCCDDu);
++	CHECK_EQ(slave->read16(0x100 + kMbDataWords), 0xCCDD);	// masked
++	u32 out = 0;
++	slave->copyOut(0x100, &out, 4);
++	CHECK_EQ(out, 0xAABBCCDDu);
++	// Exit: the slave's next barrier reports it.
++	master->requestExit();
++	CHECK(slave->barrier(0) == BarrierResult::Exit);
++}
++
++int main()
++{
++	for (auto& t : registry())
++	{
++		currentTest = t.first;
++		int before = failures;
++		t.second();
++		std::printf("%s %s\n", failures == before ? "PASS" : "FAIL", t.first);
++	}
++	std::printf("%d tests, %d checks, %d failures\n", (int)registry().size(), checks, failures);
++	return failures == 0 ? 0 : 1;
++}
+diff --git a/tests/linkbus/run-tests.sh b/tests/linkbus/run-tests.sh
+new file mode 100644
+index 000000000..42f97a845
+--- /dev/null
++++ b/tests/linkbus/run-tests.sh
+@@ -0,0 +1,20 @@
++#!/bin/sh
++# Build the LinkBus unit tests with emsdk clang and run them under node.
++# Copyright (C) 2026 John R Reeves III
++# SPDX-License-Identifier: GPL-2.0-or-later
++# Usage: tests/linkbus/run-tests.sh <emsdk dir> [out dir]
++set -e
++EMSDK_DIR=${1:?emsdk dir}
++HERE=$(cd "$(dirname "$0")" && pwd)
++ROOT=$(cd "$HERE/../.." && pwd)
++OUT=${2:-$HERE/out}
++mkdir -p "$OUT"
++export EMSDK="$EMSDK_DIR"
++export EM_CONFIG="$EMSDK_DIR/.emscripten"
++EMCC="$EMSDK_DIR/upstream/emscripten/emcc.py"
++NODE=$(ls "$EMSDK_DIR"/node/*/node.exe "$EMSDK_DIR"/node/*/bin/node 2>/dev/null | head -n 1)
++PY=$(ls "$EMSDK_DIR"/python/*/python.exe 2>/dev/null | head -n 1)
++PY=${PY:-python3}
++"$PY" "$EMCC" -std=c++17 -O1 -Wall -Wextra -fexceptions -sENVIRONMENT=node -sEXIT_RUNTIME=1 \
++	-I"$ROOT/core" "$ROOT/core/network/linkbus.cpp" "$HERE/linkbus_test.cpp" -o "$OUT/linkbus_test.js"
++"$NODE" "$OUT/linkbus_test.js"
+-- 
+2.56.0.windows.3
+

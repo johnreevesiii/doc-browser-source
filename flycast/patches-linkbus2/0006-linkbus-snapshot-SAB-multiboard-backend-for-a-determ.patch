@@ -1,0 +1,399 @@
+From 888703467e0d91a67874f35b2a9f300abe2c3d11 Mon Sep 17 00:00:00 2001
+From: John R Reeves III <johnreevesiii@outlook.com>
+Date: Mon, 2 Nov 2026 13:11:34 -0800
+Subject: [PATCH 6/9] linkbus: snapshot SAB multiboard backend for a
+ deterministic master pair
+
+The SAB multiboard backend shares the 1 MB bank and the status word
+live between the master and its graphics partner, so what a board reads
+between two sync points depends on host timing. In the single-page
+cabinet this made board 0's state differ between runs.
+
+makeSabSnapshotMultiboardBackend (exported as
+linkbus_install_sab_multiboard_snapshot) keeps a private copy of the
+bank and the status word on each board and logs its writes (one entry
+per word, newest value; status ops in order). At each sync point it
+publishes its log, passes a generation barrier, applies the logs of all
+boards in the barrier in board id order to its own copy, then passes a
+second barrier before the next log can be written. All copies are equal
+after every sync. Board 0 also applies the logs to the shared bank, from
+which a partner takes its first copy (the master cannot pass a barrier
+before the partner arrives, so the copy is stable). Writes reach the
+other board at the next sync point instead of at once. Layout:
+MultiboardSnapshotLayout (live layout plus one log region per board).
+linkbus_sab_snapshot_stats reports syncs, log overflows, second barrier
+timeouts and a bank hash. The live backend is unchanged.
+
+CMake: LINKBUS_MULTIBOARD now defaults to ON (Emscripten only), so the
+unchanged build-win.ps1 builds the multiboard class. Side effect: the
+f355 and sgdrvsim table entries (gated by NAOMI_MULTIBOARD) are now in
+the browser build.
+
+linkbus_ring_stats exports the eight ring counters.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MGX7KQ5gfrWApgW64pZbQ5
+---
+ CMakeLists.txt               |   9 +-
+ core/network/linkbus.h       |  20 +++
+ core/network/linkbus_web.cpp | 267 +++++++++++++++++++++++++++++++++++
+ 3 files changed, 295 insertions(+), 1 deletion(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 4f13036d6..4a5a641b8 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -101,7 +101,14 @@ option(ENABLE_FC_PROFILER "Build with support for host app (Flycast) profiler" O
+ option(USE_DISCORD "Use Discord Presence API" OFF)
+ option(USE_LIBCDIO "Use libcdio for CDROM access" OFF)
+ option(USE_XBRZ "Build the xBRZ texture upscaler (GPL-3.0)" ON)
+-option(LINKBUS_MULTIBOARD "Emscripten: build the NAOMI multiboard class over the LinkBus SAB backend" OFF)
++# doc-wasm/linkbus2: ON by default, so the browser core (built with the
++# unchanged build-win.ps1) carries the multiboard class for the single-page
++# five-board cabinet. It only takes effect when the host sets
++# MultiboardSlaves = 2 (or BoardId != 0) and installs a SAB backend; the
++# libretro default (MultiboardSlaves 0) leaves DOC a single board as before.
++# Side effect: the f355 and sgdrvsim table entries (gated by
++# NAOMI_MULTIBOARD) are now in the browser build too.
++option(LINKBUS_MULTIBOARD "Emscripten: build the NAOMI multiboard class over the LinkBus SAB backend" ON)
+ 
+ if(IOS AND NOT LIBRETRO)
+ 	set(USE_VULKAN OFF CACHE BOOL "Force vulkan off" FORCE)
+diff --git a/core/network/linkbus.h b/core/network/linkbus.h
+index 7f55e22dc..3cab7b72e 100644
+--- a/core/network/linkbus.h
++++ b/core/network/linkbus.h
+@@ -511,4 +511,24 @@ private:
+ // Browser: SAB plus Atomics through JS imports (linkbus_web.cpp, Emscripten).
+ std::unique_ptr<MultiboardBackend> makeSabMultiboardBackend(int boardId);
+ 
++// Snapshot variant of the SAB backend (doc-wasm/linkbus2), for a
++// deterministic master pair. Each board works on a private copy of the bank
++// and of the status word and logs its writes. At each sync point (two
++// generation barriers) every board publishes its log, then applies the logs
++// of all boards in the barrier, in board id order, to its own copy, so all
++// copies are equal after every sync and nothing a board reads between sync
++// points depends on host timing. Board 0 also applies them to the shared
++// bank, which a partner copies when it is created. Writes become visible to
++// the other board at the next sync point (natively: at once). Layout: the
++// MultiboardSabLayout followed by one log region per board.
++struct MultiboardSnapshotLayout
++{
++	static constexpr u32 logEntries = kMbDataWords + 0x10000;	// distinct words + status ops
++	static constexpr u32 logHeaderBytes = 16;			// i32 entries, i32 overflow
++	static constexpr u32 logBytes = logHeaderBytes + logEntries * 8;	// entry: u32 index, u32 value
++	static constexpr u32 logBase = MultiboardSabLayout::totalBytes;
++	static constexpr u32 totalBytes = logBase + kMbMaxBoards * logBytes;
++};
++std::unique_ptr<MultiboardBackend> makeSabSnapshotMultiboardBackend(int boardId);
++
+ } // namespace linkbus
+diff --git a/core/network/linkbus_web.cpp b/core/network/linkbus_web.cpp
+index b66582bdd..ac6473bc5 100644
+--- a/core/network/linkbus_web.cpp
++++ b/core/network/linkbus_web.cpp
+@@ -53,6 +53,9 @@
+ 
+ #include <emscripten.h>
+ #include <memory>
++#include <vector>
++#include <cstring>
++#include <cstdint>
+ 
+ // ---------------------------------------------------------------------------
+ // JS imports: ring mailbox
+@@ -211,6 +214,15 @@ EM_JS(int, lb_cab_barrier, (int boardId, int timeoutMs), {
+ 	return 0;
+ });
+ 
++// Snapshot backend: bulk copies between the wasm heap and the cabinet buffer.
++EM_JS(void, lb_cab_put, (int byteOffset, const void *src, int bytes), {
++	new Uint8Array(Module.linkbus.cabinet, byteOffset, bytes).set(HEAPU8.subarray(src, src + bytes));
++});
++
++EM_JS(void, lb_cab_get, (int byteOffset, void *dst, int bytes), {
++	HEAPU8.set(new Uint8Array(Module.linkbus.cabinet, byteOffset, bytes), dst);
++});
++
+ EM_JS(void, lb_cab_start_partners, (int boardId, int slaves), {
+ 	var lb = Module.linkbus;
+ 	var msg = { type: 'linkbus-start-partners', boardId: boardId, slaves: slaves };
+@@ -336,6 +348,212 @@ private:
+ 	int id;
+ };
+ 
++// Snapshot backend (see MultiboardSnapshotLayout in linkbus.h).
++constexpr u32 kStatusOp = 0x80000000u;	// log entry index of a status op: kStatusOp | op
++
++class SabSnapshotBoard : public MultiboardBackend
++{
++public:
++	~SabSnapshotBoard() override { requestExit(); }
++
++	explicit SabSnapshotBoard(int boardId)
++		: id(boardId), bank(kMbDataWords), pos(kMbDataWords, kNone)
++	{
++		if (id == 0)
++		{
++			lb_cab_hdr(1, kStatus, 0);
++			lb_cab_hdr(1, kExit, 0);
++			lb_cab_hdr(1, kArrived, 0);
++			lb_cab_hdr(1, kBoardMask, 1);
++		}
++		// A partner is created after the master's startPartners() and before
++		// its own first barrier. The master cannot pass its next barrier
++		// before the partner arrives, and it writes the shared bank only
++		// inside a sync, so this copy is stable. The master's writes since
++		// its last sync reach the partner through the master's log.
++		lb_cab_get((int)kData, bank.data(), (int)(kMbDataWords * 2));
++		stat = statBase = (u16)lb_cab_hdr(0, kStatus, 0);
++		log.reserve(4096);
++	}
++
++	int boardId() const override { return id; }
++
++	u16 status() const override { return stat; }
++	void setStatus(u16 v) override { stat = v; logOp(1, v); }
++	void statusOr(u16 bits) override { stat |= bits; logOp(2, bits); }
++	void statusAnd(u16 bits) override { stat &= bits; logOp(3, bits); }
++
++	u16 read16(u32 i) const override { return bank[i & (kMbDataWords - 1)]; }
++	void write16(u32 i, u16 v) override
++	{
++		i &= kMbDataWords - 1;
++		bank[i] = v;
++		if (pos[i] != kNone)
++			log[pos[i] + 1] = v;	// same word again: one entry, newest value
++		else if (log.size() / 2 < MultiboardSnapshotLayout::logEntries)
++		{
++			pos[i] = (u32)log.size();
++			log.push_back(i);
++			log.push_back(v);
++		}
++		else
++			overflow = true;
++	}
++	u32 read32(u32 i) const override
++	{
++		i &= kMbDataWords - 1;
++		u32 v = read16(i);
++		if (i + 1 < kMbDataWords)
++			v |= (u32)read16(i + 1) << 16;
++		return v;
++	}
++	void write32(u32 i, u32 v) override
++	{
++		i &= kMbDataWords - 1;
++		write16(i, (u16)v);
++		if (i + 1 < kMbDataWords)
++			write16(i + 1, (u16)(v >> 16));
++	}
++	void copyOut(u32 i, void *dst, u32 bytes) const override
++	{
++		i &= kMbDataWords - 1;
++		if (bytes > (kMbDataWords - i) * 2)
++			bytes = (kMbDataWords - i) * 2;
++		memcpy(dst, &bank[i], bytes);
++	}
++
++	BarrierResult barrier(u32 timeoutMs) override
++	{
++		using L = MultiboardSnapshotLayout;
++		// Publish this board's log. The other boards read it only between
++		// the two barriers below; this board writes it only before the first.
++		const int region = (int)(L::logBase + (u32)id * L::logBytes);
++		const int32_t hdr[4] = { (int32_t)(log.size() / 2), overflow ? 1 : 0, 0, 0 };
++		lb_cab_put(region, hdr, (int)sizeof(hdr));
++		if (!log.empty())
++			lb_cab_put(region + (int)L::logHeaderBytes, log.data(), (int)(log.size() * 4));
++		BarrierResult r = toResult(lb_cab_barrier(id, (int)timeoutMs));
++		if (r != BarrierResult::Ok)
++			return r;	// keep the log: it is published again at the next sync
++		const u32 mask = (u32)lb_cab_hdr(0, kBoardMask, 0);
++		u16 s = statBase;
++		for (int b = 0; b < kMbMaxBoards; b++)
++		{
++			if (!(mask & (1u << b)))
++				continue;
++			const std::vector<u32> *entries = &log;
++			if (b != id)
++			{
++				const int other = (int)(L::logBase + (u32)b * L::logBytes);
++				int32_t oh[4];
++				lb_cab_get(other, oh, (int)sizeof(oh));
++				if (oh[1] != 0)
++					stats.overflow++;
++				peer.resize((size_t)oh[0] * 2);
++				if (!peer.empty())
++					lb_cab_get(other + (int)L::logHeaderBytes, peer.data(), (int)(peer.size() * 4));
++				entries = &peer;
++			}
++			for (size_t k = 0; k + 1 < entries->size(); k += 2)
++			{
++				const u32 idx = (*entries)[k];
++				const u32 val = (*entries)[k + 1];
++				if (idx & kStatusOp)
++				{
++					switch (idx & 3)
++					{
++					case 1: s = (u16)val; break;
++					case 2: s |= (u16)val; break;
++					case 3: s &= (u16)val; break;
++					}
++				}
++				else
++					bank[idx & (kMbDataWords - 1)] = (u16)val;
++			}
++			if (id == 0)
++				applyShared(*entries);	// board order, as above
++		}
++		if (overflow)
++			stats.overflow++;
++		if (id == 0)
++			lb_cab_hdr(1, kStatus, s);
++		stat = statBase = s;
++		for (size_t k = 0; k + 1 < log.size(); k += 2)
++			if (!(log[k] & kStatusOp))
++				pos[log[k]] = kNone;
++		log.clear();
++		overflow = false;
++		stats.syncs++;
++		// Second barrier: nobody publishes the next log (or touches the
++		// shared bank) before every board has read this round.
++		r = toResult(lb_cab_barrier(id, (int)timeoutMs));
++		if (r == BarrierResult::Timeout)
++			stats.secondTimeout++;
++		return r == BarrierResult::Exit ? r : BarrierResult::Ok;
++	}
++
++	void requestExit() override
++	{
++		lb_cab_hdr(1, kExit, 1);
++		lb_cab_notify();
++	}
++
++	void startPartners(int slaves) override
++	{
++		if (slaves < 0) slaves = 0;
++		if (slaves > kMbMaxBoards - 1) slaves = kMbMaxBoards - 1;
++		lb_cab_hdr(1, kArrived, 0);
++		lb_cab_hdr(1, kBoardMask, (1 << (slaves + 1)) - 1);
++		lb_cab_start_partners(id, slaves);
++	}
++
++	struct Stats { u32 syncs = 0, overflow = 0, secondTimeout = 0; } stats;
++
++	// 64-bit FNV-1a over the private bank and status, for run comparison.
++	uint64_t bankHash() const
++	{
++		uint64_t h = 0xcbf29ce484222325ull;
++		for (u32 i = 0; i < kMbDataWords; i++) { h ^= bank[i]; h *= 0x100000001b3ull; }
++		h ^= stat;
++		h *= 0x100000001b3ull;
++		return h;
++	}
++
++private:
++	static constexpr u32 kNone = 0xffffffffu;
++	static BarrierResult toResult(int r)
++	{
++		return r == 0 ? BarrierResult::Ok : r == 2 ? BarrierResult::Exit : BarrierResult::Timeout;
++	}
++	void logOp(u32 op, u16 v)
++	{
++		if (log.size() / 2 < MultiboardSnapshotLayout::logEntries)
++		{
++			log.push_back(kStatusOp | op);
++			log.push_back(v);
++		}
++		else
++			overflow = true;
++	}
++	static void applyShared(const std::vector<u32> &entries)
++	{
++		for (size_t k = 0; k + 1 < entries.size(); k += 2)
++			if (!(entries[k] & kStatusOp))
++				lb_cab_write16(entries[k] & (kMbDataWords - 1), (int)entries[k + 1], kData);
++	}
++
++	int id;
++	std::vector<u16> bank;
++	std::vector<u32> pos;		// log position of each word written since the last sync
++	std::vector<u32> log;		// pairs: word index (or kStatusOp | op), value
++	std::vector<u32> peer;
++	u16 stat = 0;
++	u16 statBase = 0;
++	bool overflow = false;
++};
++
++SabSnapshotBoard *snapshotBoard = nullptr;	// the board this core runs, for stats
++
+ FramePacer pacer;
+ 
+ } // namespace
+@@ -347,6 +565,15 @@ std::unique_ptr<MultiboardBackend> makeSabMultiboardBackend(int boardId)
+ 	return std::make_unique<SabBoard>(boardId);
+ }
+ 
++std::unique_ptr<MultiboardBackend> makeSabSnapshotMultiboardBackend(int boardId)
++{
++	if (!lb_cab_ok((int)MultiboardSnapshotLayout::totalBytes))
++		return nullptr;
++	auto board = std::make_unique<SabSnapshotBoard>(boardId);
++	snapshotBoard = board.get();
++	return board;
++}
++
+ } // namespace linkbus
+ 
+ using namespace linkbus;
+@@ -382,6 +609,46 @@ EMSCRIPTEN_KEEPALIVE void linkbus_install_sab_multiboard() {
+ 	setMultiboardFactory([](int boardId) { return makeSabMultiboardBackend(boardId); });
+ }
+ 
++// Deterministic master pair (MultiboardSnapshotLayout). The cabinet buffer
++// must be at least linkbus_sab_snapshot_bytes() long.
++EMSCRIPTEN_KEEPALIVE void linkbus_install_sab_multiboard_snapshot() {
++	setMultiboardFactory([](int boardId) { return makeSabSnapshotMultiboardBackend(boardId); });
++}
++
++EMSCRIPTEN_KEEPALIVE u32 linkbus_sab_snapshot_bytes() {
++	return MultiboardSnapshotLayout::totalBytes;
++}
++
++// Snapshot board stats: out[0] syncs, out[1] log overflows, out[2] second
++// barrier timeouts, out[3..4] bank hash (lo, hi). Returns 5, or 0 when this
++// core has no snapshot board.
++EMSCRIPTEN_KEEPALIVE int linkbus_sab_snapshot_stats(u32 *out)
++{
++	if (snapshotBoard == nullptr)
++		return 0;
++	const uint64_t h = snapshotBoard->bankHash();
++	out[0] = snapshotBoard->stats.syncs;
++	out[1] = snapshotBoard->stats.overflow;
++	out[2] = snapshotBoard->stats.secondTimeout;
++	out[3] = (u32)h;
++	out[4] = (u32)(h >> 32);
++	return 5;
++}
++
++// Ring stats (8 u32): published, taken, stale, dropped, badEdition, badSize,
++// badHeader, staleTick. Returns the count written, 0 if no ring.
++EMSCRIPTEN_KEEPALIVE int linkbus_ring_stats(u32 *out)
++{
++	RingBackend *ring = ringBackend();
++	if (ring == nullptr)
++		return 0;
++	RingBackend::Stats s = ring->stats();
++	const u32 v[] = { s.published, s.taken, s.stale, s.dropped, s.badEdition, s.badSize, s.badHeader, s.staleTick };
++	for (u32 i = 0; i < sizeof(v) / sizeof(v[0]); i++)
++		out[i] = v[i];
++	return (int)(sizeof(v) / sizeof(v[0]));
++}
++
+ // Pacing, once per host frame (see the file header).
+ EMSCRIPTEN_KEEPALIVE int linkbus_pacer_frames()
+ {
+-- 
+2.56.0.windows.3
+

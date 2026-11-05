@@ -2,8 +2,9 @@
 
 Copyright (C) 2026 John R Reeves III. GPL-2.0-or-later, like the code it carries.
 
-Applied with `git am` on top of `../patches/` (commit e2e54ca6cc5e), these
-nine patches give tree 4da9f93a87f7, the source of the served five-board core.
+Applied with `git am` on top of `../patches/` (commit 4cb999d50434), these
+ten patches give commit b3e207a43bcf (tree 9369df86118d), the source of the
+served five-board core.
 They add LinkBus: a seam for the NAOMI M3 comm board ring and the multiboard
 bank, so that the five boards of a linked cabinet can run in one browser page
 (one core per worker) and talk through SharedArrayBuffer mailboxes instead of
@@ -20,6 +21,7 @@ UDP sockets and OS shared memory. How to apply and build: `../../SOURCE.md`.
 | 0007 | linkbus: header-only rounds are stale, board id is clamped |
 | 0008 | naomi: no automatic F355 multiboard in the browser build |
 | 0009 | linkbus: vblank barrier; loud snapshot failures |
+| 0010 | linkbus: accept the J99 (3), J2K (4) and RD (5) edition tags |
 
 The host side of the link is `host/shim/linkbus_shim.cpp` and
 `host/src/lb-*.js`.

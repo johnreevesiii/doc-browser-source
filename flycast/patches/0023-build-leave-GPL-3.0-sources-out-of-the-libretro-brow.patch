@@ -1,0 +1,201 @@
+From 4cb999d50434f7ad00bdbee2ef0d62b68804bdbe Mon Sep 17 00:00:00 2001
+From: John R Reeves III <johnreevesiii@outlook.com>
+Date: Thu, 5 Nov 2026 12:00:00 -0800
+Subject: [PATCH] build: leave GPL-3.0 sources out of the libretro browser
+ build
+
+Two files in the browser core carry GPL version 3 terms. Neither is
+needed to run NAOMI games.
+
+1. core/imgread/isofs.cpp includes libcdio's iso9660.h
+   (GPL-3.0-or-later). New option USE_ISOFS: OFF by default when LIBRETRO
+   and EMSCRIPTEN (the browser core), ON otherwise. With it OFF,
+   iso9660.h, isofs.cpp and isofs.h are not part of the build, NO_ISOFS
+   is defined, and reios_locate_bootfile (Dreamcast HLE BIOS disc boot)
+   logs an error and returns false, so reios_boot reports "Failed to
+   locate bootfile". It is reached only when
+   settings.platform.isConsole(); reios_boot loads a NAOMI game from the
+   cartridge and never uses the ISO reader. The only other user, the box
+   art scraper, is built only without LIBRETRO, so USE_ISOFS=OFF is
+   refused there.
+
+2. core/achievements/achievements.cpp is derived from DuckStation and
+   marked "GPL-3.0 OR CC-BY-NC-ND-4.0". The libretro build never defines
+   USE_RACHIEVEMENTS, so it compiled only the file's savestate stub. It
+   now compiles core/achievements/achievements_stub.cpp (new,
+   GPL-2.0-or-later) instead, which writes and skips the same
+   size-prefixed block, so savestates are unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MGX7KQ5gfrWApgW64pZbQ5
+---
+ CMakeLists.txt                          | 17 +++++++++
+ core/achievements/CMakeLists.txt        | 16 +++++++--
+ core/achievements/achievements_stub.cpp | 48 +++++++++++++++++++++++++
+ core/imgread/CMakeLists.txt             | 12 ++++---
+ core/reios/reios.cpp                    | 10 ++++++
+ 5 files changed, 96 insertions(+), 7 deletions(-)
+ create mode 100644 core/achievements/achievements_stub.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 8db85cd80..ae42113c8 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -942,6 +942,23 @@ if(NOT LIBRETRO)
+ 			core/deps/implot/implot_items.cpp)
+ 	endif()
+ endif()
++# The ISO 9660 reader (core/imgread/isofs.cpp) includes libcdio's iso9660.h,
++# which is GPL-3.0-or-later. Only the Dreamcast HLE BIOS disc boot
++# (reios_locate_bootfile) and the standalone UI's box art scraper use it.
++# The browser (libretro, Emscripten) build runs NAOMI games from ROM files
++# and leaves it out by default, so the unchanged build-win.ps1 drops it.
++if(LIBRETRO AND EMSCRIPTEN)
++	set(USE_ISOFS_DEFAULT OFF)
++else()
++	set(USE_ISOFS_DEFAULT ON)
++endif()
++option(USE_ISOFS "Build the ISO 9660 reader for Dreamcast disc boot (uses libcdio's iso9660.h, GPL-3.0-or-later)" ${USE_ISOFS_DEFAULT})
++if(NOT USE_ISOFS)
++	if(NOT LIBRETRO)
++		message(FATAL_ERROR "USE_ISOFS=OFF is only supported in the libretro build (the box art scraper needs IsoFs)")
++	endif()
++	target_compile_definitions(${PROJECT_NAME} PRIVATE NO_ISOFS)
++endif()
+ if(USE_XBRZ)
+ 	target_sources(${PROJECT_NAME} PRIVATE core/deps/xbrz/xbrz.cpp)
+ else()
+diff --git a/core/achievements/CMakeLists.txt b/core/achievements/CMakeLists.txt
+index 57d8814e7..6e1f62e57 100644
+--- a/core/achievements/CMakeLists.txt
++++ b/core/achievements/CMakeLists.txt
+@@ -1,3 +1,13 @@
+-target_sources(${PROJECT_NAME} PRIVATE
+-        achievements.cpp
+-        achievements.h)
++# achievements.cpp is derived from DuckStation and marked
++# "GPL-3.0 OR CC-BY-NC-ND-4.0". The libretro build has no RetroAchievements
++# (USE_RACHIEVEMENTS is defined only without LIBRETRO) and only needs the
++# savestate stub, so it compiles achievements_stub.cpp instead.
++if(LIBRETRO)
++    target_sources(${PROJECT_NAME} PRIVATE
++            achievements_stub.cpp
++            achievements.h)
++else()
++    target_sources(${PROJECT_NAME} PRIVATE
++            achievements.cpp
++            achievements.h)
++endif()
+diff --git a/core/achievements/achievements_stub.cpp b/core/achievements/achievements_stub.cpp
+new file mode 100644
+index 000000000..297321635
+--- /dev/null
++++ b/core/achievements/achievements_stub.cpp
+@@ -0,0 +1,48 @@
++/*
++	Copyright 2026 John R Reeves III
++
++	This file is part of Flycast.
++
++    Flycast is free software: you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 2 of the License, or
++    (at your option) any later version.
++
++    Flycast is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with Flycast.  If not, see <https://www.gnu.org/licenses/>.
++ */
++// Savestate hooks for builds without RetroAchievements (the libretro build).
++// A savestate from version V50 on carries a size-prefixed achievements block:
++// write an empty one, and skip whatever block a loaded state carries.
++#include "achievements.h"
++#include "serialize.h"
++
++#ifdef USE_RACHIEVEMENTS
++#error "achievements_stub.cpp is for builds without USE_RACHIEVEMENTS"
++#endif
++
++namespace achievements
++{
++
++void serialize(Serializer& ser)
++{
++	u32 size = 0;
++	ser << size;
++}
++
++void deserialize(Deserializer& deser)
++{
++	if (deser.version() >= Deserializer::V50)
++	{
++		u32 size;
++		deser >> size;
++		deser.skip(size);
++	}
++}
++
++}	// namespace achievements
+diff --git a/core/imgread/CMakeLists.txt b/core/imgread/CMakeLists.txt
+index ca2ecf2e9..5c7223b9d 100644
+--- a/core/imgread/CMakeLists.txt
++++ b/core/imgread/CMakeLists.txt
+@@ -6,7 +6,11 @@ target_sources(${PROJECT_NAME} PRIVATE
+         common.h
+         cue.cpp
+         gdi.cpp
+-        ImgReader.cpp
+-        iso9660.h
+-        isofs.cpp
+-        isofs.h)
++        ImgReader.cpp)
++
++if(USE_ISOFS)
++    target_sources(${PROJECT_NAME} PRIVATE
++            iso9660.h
++            isofs.cpp
++            isofs.h)
++endif()
+diff --git a/core/reios/reios.cpp b/core/reios/reios.cpp
+index f82353178..16234fab2 100644
+--- a/core/reios/reios.cpp
++++ b/core/reios/reios.cpp
+@@ -23,7 +23,9 @@
+ #include "hw/aica/aica_if.h"
+ #include "hw/pvr/pvr_regs.h"
+ #include "imgread/common.h"
++#ifndef NO_ISOFS
+ #include "imgread/isofs.h"
++#endif
+ #include "hw/sh4/sh4_mmr.h"
+ #include "oslib/resources.h"
+ #include "oslib/oslib.h"
+@@ -73,6 +75,13 @@ static bool reios_locate_bootfile(const char* bootfile)
+ 	// Load IP.BIN bootstrap
+ 	libGDR_ReadSector(GetMemPtr(0x8c008000, 0), base_fad, 16, 2048);
+ 
++#ifdef NO_ISOFS
++	// Built without the ISO 9660 reader (USE_ISOFS=OFF): a Dreamcast disc
++	// cannot be booted through the HLE BIOS. reios_boot reports the failure.
++	// NAOMI never comes here: reios_boot loads a NAOMI game from the cartridge.
++	ERROR_LOG(REIOS, "Boot file '%s' not loaded: built without the ISO 9660 reader", bootfile);
++	return false;
++#else
+ 	IsoFs isofs(disc);
+ 	std::unique_ptr<IsoFs::Directory> root(isofs.getRoot());
+ 	if (root == nullptr)
+@@ -134,6 +143,7 @@ static bool reios_locate_bootfile(const char* bootfile)
+ 	memcpy(GetMemPtr(0x8c000068, sizeof(data)), data, sizeof(data));
+ 
+ 	return true;
++#endif // NO_ISOFS
+ }
+ 
+ ip_meta_t ip_meta;
+-- 
+2.56.0.windows.3
+

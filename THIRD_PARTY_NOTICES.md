@@ -5,10 +5,13 @@ Written by Claude (Claude Code) for John R Reeves III, 2026-11-03.
 This file gives the licence texts that the permissive (BSD, MIT, Zlib, BSL
 and similar) parts of the browser Flycast cores require to travel with the
 binaries. The cores themselves are distributed under the GNU General Public
-License, version 3 or (at your option) any later version, while they carry
-libcdio's `iso9660.h`; our own code is version 2 or later. See `LICENSE`,
-`LICENSE.GPL-3` and `COPYRIGHT`. The full corresponding source is this repository plus upstream
-Flycast; see `SOURCE.md`.
+License, version 2, because they carry picoTCP (GPL-2.0-only OR
+GPL-3.0-only); our own code is version 2 or later. See `LICENSE` and
+`COPYRIGHT`. The full corresponding source is this repository plus upstream
+Flycast; see `SOURCE.md`. This repository no longer carries a copy of GPL
+version 3: since patch 0023 no GPL version 3 code is in the cores or in this
+repository, and picoTCP, which also allows version 3, is used here under
+version 2.
 
 Which parts are listed: those whose code is linked into the served cores
 (`flycast_libretro.wasm`, single-board and five-board), established from a
@@ -21,8 +24,8 @@ nlohmann json.
 Parts that need no notice text here but are named for completeness:
 
 - Flycast (GPL-2.0-or-later) and flycast-wasm (GPL-2.0): the program itself.
-- picoTCP (GPL-2.0-only OR GPL-3.0-only, core/deps/picotcp): copyleft, covered
-  by the source offer.
+- picoTCP (GPL-2.0-only OR GPL-3.0-only, core/deps/picotcp): copyleft, used
+  under GPL version 2, covered by the source offer.
 - LZMA SDK by Igor Pavlov (core/deps/lzma): public domain.
 - Dolphin BitSet.h: public domain.
 

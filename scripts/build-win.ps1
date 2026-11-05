@@ -38,6 +38,10 @@
   Resolve tools, run preflight checks and print the exact commands. Runs no
   configure and no build (only tool --version queries and read-only git queries).
 
+.PARAMETER CheckOnly
+  Skip configure and build. Run only the licence checks (archive members and
+  the GPL-3 scan of build.ninja and ninja -t deps) on an existing BuildDir.
+
 .PARAMETER InitSubmodules
   Run "git submodule update --init --recursive" in SourceDir first (a git
   download). Off by default because W1 owns the worktree.
@@ -52,6 +56,7 @@ param(
     [string]$BuildDir = '',
     [switch]$ConfigureOnly,
     [switch]$DryRun,
+    [switch]$CheckOnly,
     [switch]$InitSubmodules
 )
 
@@ -104,6 +109,7 @@ New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 $Mode    = 'build'
 if ($ConfigureOnly) { $Mode = 'configure' }
 if ($DryRun) { $Mode = 'dryrun' }
+if ($CheckOnly) { $Mode = 'check' }
 $LogFile = Join-Path $LogDir "build-win-$Stamp-$Mode.log"
 $ProvFile = Join-Path $LogDir "provenance-$Stamp-$Mode.json"
 
@@ -284,24 +290,79 @@ if ($Problems.Count -gt 0) {
     Fail 'preflight failed; see PREFLIGHT lines above'
 }
 
-New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
-$code = Invoke-Logged $CmakeExe $ConfigureArgs
-if ($code -ne 0) { $prov.result = "configure failed ($code)"; Save-Prov; Fail "configure failed ($code); log: $LogFile" }
-if ($ConfigureOnly) { $prov.result = 'configured'; Save-Prov; Log "configured. log: $LogFile"; exit 0 }
+if (-not $CheckOnly) {
+    New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
+    $code = Invoke-Logged $CmakeExe $ConfigureArgs
+    if ($code -ne 0) { $prov.result = "configure failed ($code)"; Save-Prov; Fail "configure failed ($code); log: $LogFile" }
+    if ($ConfigureOnly) { $prov.result = 'configured'; Save-Prov; Log "configured. log: $LogFile"; exit 0 }
 
-$code = Invoke-Logged $CmakeExe $BuildArgs
-if ($code -ne 0) { $prov.result = "build failed ($code)"; Save-Prov; Fail "build failed ($code); log: $LogFile" }
+    $code = Invoke-Logged $CmakeExe $BuildArgs
+    if ($code -ne 0) { $prov.result = "build failed ($code)"; Save-Prov; Fail "build failed ($code); log: $LogFile" }
+}
 
 $Lib = Join-Path $BuildDir $ExpectedLib
 if (-not (Test-Path -LiteralPath $Lib)) { $prov.result = 'build ok but library missing'; Save-Prov; Fail "build finished but $ExpectedLib not found" }
-# D-063 check: no xBRZ or libcdio object may end up in the library.
+# D-063 check: no xBRZ, libcdio, ISO 9660 reader (libcdio's iso9660.h, GPL-3.0-or-later)
+# or DuckStation achievements.cpp (GPL-3.0 OR CC-BY-NC-ND-4.0) object may end up in the
+# library. Patch 0023 leaves the last two out of the libretro build.
 $prevEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
 $Members = @(& (Join-Path $EmscriptenDir 'emar.bat') 't' $Lib 2>$null)
 $ErrorActionPreference = $prevEap
-$Banned = @($Members | Where-Object { $_ -match '(?i)xbrz|libcdio' })
-if ($Banned.Count -gt 0) { $prov.result = 'built but contains excluded code'; Save-Prov; Fail ('library contains excluded objects: ' + ($Banned -join ', ')) }
+$Banned = @($Members | Where-Object { $_ -match '(?i)xbrz|libcdio|iso9660|isofs|^achievements\.cpp' })
+if ($Banned.Count -gt 0) { Log ('EXCLUDED: library contains excluded objects: ' + ($Banned -join ', ')) }
 $prov['library_members'] = $Members.Count
+
+# GPL-3 check: every file the build compiled or included (ninja -t deps, plus the
+# sources named in build.ninja) is read, and the build fails if one carries GPL
+# version 3 terms that do not also allow version 2: an SPDX expression naming
+# GPL-3 but no GPL-2, or "version 3" licence-header text. picoTCP (GPL-2.0 OR
+# GPL-3.0) passes, because it allows version 2. Licence notices are read from
+# the first 6000 characters of each file.
+$prevEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+$DepsOut = @(& $NinjaExe -C $BuildDir -t deps 2>$null)
+$ErrorActionPreference = $prevEap
+if ($DepsOut.Count -eq 0) { $prov.result = 'ninja -t deps gave no output'; Save-Prov; Fail 'ninja -t deps gave no output' }
+$DepFiles = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
+$StaleDeps = 0
+foreach ($l in $DepsOut) {
+    if ($l -match '^\s{4}(\S.*)$') { [void]$DepFiles.Add($Matches[1].Trim()) }
+    elseif ($l -match '\((STALE|deps not found)') { $StaleDeps++ }
+}
+foreach ($l in (Get-Content -LiteralPath (Join-Path $BuildDir 'build.ninja'))) {
+    if ($l -match '^build \S+\.o: \S+ (\S+)') {
+        $src = $Matches[1] -replace '\$:', ':'
+        if (-not [System.IO.Path]::IsPathRooted($src)) { $src = Join-Path $BuildDir $src }
+        [void]$DepFiles.Add($src)
+    }
+}
+$Gpl3Text = '(?i)either version 3 of the License|version 3 of the GNU General Public License|GNU General Public License v3|GPLv3\+'
+$Gpl3Hits = New-Object System.Collections.Generic.List[string]
+$Unread = 0
+foreach ($f in $DepFiles) {
+    if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { $Unread++; continue }
+    $text = [System.IO.File]::ReadAllText($f)
+    $head = $text.Substring(0, [Math]::Min(6000, $text.Length))
+    $why = $null
+    foreach ($m in [regex]::Matches($text, 'SPDX-License-Identifier:\s*([^\r\n*]+)')) {
+        $expr = $m.Groups[1].Value
+        if ($expr -match '(?i)GPL-3' -and $expr -notmatch '(?i)GPL-2') { $why = "SPDX $($expr.Trim())" }
+    }
+    if ($null -eq $why -and $head -match $Gpl3Text) { $why = "header text '$($Matches[0])'" }
+    if ($null -ne $why) { $Gpl3Hits.Add("$f ($why)") }
+}
+$prov['licence_scan_files'] = $DepFiles.Count
+$prov['licence_scan_unreadable'] = $Unread
+$prov['licence_scan_stale_deps'] = $StaleDeps
+$prov['licence_scan_gpl3'] = @($Gpl3Hits)
+Log "licence scan: $($DepFiles.Count) files from build.ninja and ninja -t deps, $Unread missing, $StaleDeps stale deps entries, $($Gpl3Hits.Count) GPL-3"
+if ($StaleDeps -gt 0) { $prov.result = 'stale ninja deps'; Save-Prov; Fail 'ninja -t deps has stale entries; rebuild before the licence scan' }
+foreach ($h in $Gpl3Hits) { Log "GPL-3: $h" }
+if ($Banned.Count -gt 0 -or $Gpl3Hits.Count -gt 0) {
+    $prov.result = 'built but contains excluded or GPL-3 code'; Save-Prov
+    Fail ("library contains $($Banned.Count) excluded objects; build compiled $($Gpl3Hits.Count) GPL-3 files")
+}
 $prov.result = 'built'
+if ($CheckOnly) { $prov.result = 'checked' }
 $prov['library'] = $Lib
 $prov['library_sha256'] = (Get-FileHash -LiteralPath $Lib -Algorithm SHA256).Hash
 Save-Prov

@@ -6,11 +6,10 @@ The Derby Owners Club browser game runs on two Flycast cores built for
 WebAssembly. This file says which source each served core comes from and how
 to rebuild it. The host page and our patches are free software under the GNU
 General Public License, version 2 or (at your option) any later version
-(`LICENSE`). The served cores also contain libcdio's `iso9660.h`
-(GPL-3.0-or-later), so the combined cores are distributed under version 3 or
-any later version (`LICENSE.GPL-3`) until patch 0023 (section 8) takes it
-out; see `COPYRIGHT`. Notices for the permissive third-party parts are in
-`THIRD_PARTY_NOTICES.md`.
+(`LICENSE`). The served cores also contain picoTCP (GPL-2.0-only OR
+GPL-3.0-only), so each combined core is distributed under version 2 of the
+GNU General Public License; see `COPYRIGHT` and section 8. Notices for the
+permissive third-party parts are in `THIRD_PARTY_NOTICES.md`.
 
 No game data is here or in the cores. The player supplies the game files,
 which stay in the player's browser.
@@ -41,18 +40,17 @@ Everything below is in this repository except upstream Flycast itself.
 | | Single-board core | Five-board core |
 |---|---|---|
 | Upstream base | Flycast 8412d3d8a391 (https://github.com/flyinghead/flycast) | same |
-| Patch series | `flycast/patches/0001` to `0022` | `flycast/patches/0001` to `0022`, then `flycast/patches-linkbus2/0001` to `0009` |
-| Resulting Flycast tree | commit e2e54ca6cc5e (branch `doc-wasm/8412d3d8a`), tree 5d1858a1703f | tree 4da9f93a87f7 (the tree of `doc-wasm/linkbus2` commit 0fb4009b4) |
-| Version string inside the wasm | `v2.6-317-ge2e54ca6c` | `v2.6-323-g888703467` (see 5.2) |
+| Patch series | `flycast/patches/0001` to `0023` | `flycast/patches/0001` to `0023`, then `flycast/patches-linkbus2/0001` to `0010` |
+| Resulting Flycast tree | commit 4cb999d50434, tree 8fee3edf1bc4 | commit b3e207a43bcf, tree 9369df86118d |
+| Version string inside the wasm | `v2.6-318-g4cb999d50` | `v2.6-328-gb3e207a43` |
 | Library build | `scripts/build-win.ps1` | `scripts/build-win.ps1 -SourceDir <ExtRoot>/wt-linkbus2` |
 | Link | `scripts/link-win.ps1` | `scripts/link-linkbus2.ps1` |
 | Host shim linked in | `host/shim/libretro_shim.c`, `core_config_shim.cpp`, `debug_state_shim.cpp`, `stubs/flycast_stubs.c` | the same plus `host/shim/linkbus_shim.cpp` |
 
 The patch series, shims, stubs and link scripts in this repository are the
-ones the served cores were built from (single-board: commit e2e54ca6c;
-five-board: tree 0fb4009b4, both built 2026-11-02). The host page in `host/`
-matches the page served at `/pilot` on 2026-11-03. Section 7 says how a
-release is tagged.
+ones the cores of release `web-2026.11.05-1` were built from (single-board:
+commit 4cb999d50434; five-board: commit b3e207a43bcf; both built 2026-11-05
+by the recipe in section 4). Section 7 says how a release is tagged.
 
 Upstream submodules used by the build, all pinned by the Flycast tree:
 libchdr 5f82799f2, tinygettext 41572a67f (and its tinycmmc 9a51e1380), asio
@@ -98,8 +96,8 @@ foreach ($t in 'wt-8412d3d8a', 'wt-linkbus2') {
 }
 git -C <ExtRoot>\wt-linkbus2 am --keep-cr --committer-date-is-author-date <doc-browser-source>\flycast\patches-linkbus2\*.patch
 
-# Checks: wt-8412d3d8a HEAD is e2e54ca6cc5eb4091404c13212520c0055e02205;
-#         wt-linkbus2 HEAD^{tree} is 4da9f93a87f71253e0233b253cf04efa5d1c53b5.
+# Checks: wt-8412d3d8a HEAD is 4cb999d50434f7ad00bdbee2ef0d62b68804bdbe;
+#         wt-linkbus2 HEAD is b3e207a43bcf4d54585f9e04bbde349eccc5cfa4.
 
 # 3. Libraries (about 2 minutes each on 32 threads)
 powershell -NoProfile -File <doc-browser-source>\scripts\build-win.ps1 -ExtRoot <ExtRoot>
@@ -115,7 +113,12 @@ board) and `<ExtRoot>\build-wasm\link-out-linkbus2\flycast_libretro.{js,wasm}`
 (five board). Each script writes a log and a provenance record to
 `<ExtRoot>\build-logs`. The header of each script explains its options;
 `build-win.ps1` passes `-DUSE_XBRZ=OFF`, `-DUSE_LIBCDIO=OFF` and
-`-DUSE_BUNDLED_GAME_DATA=OFF` (section 8).
+`-DUSE_BUNDLED_GAME_DATA=OFF`, and patch 0023 turns `USE_ISOFS` off by default
+in this build (section 8). After building, `build-win.ps1` refuses the library
+if it holds an xBRZ, libcdio, ISO 9660 reader or `achievements.cpp` object, or
+if any file in `build.ninja` or `ninja -t deps` carries GPL version 3 terms
+that do not also allow version 2. `-CheckOnly` runs only these checks on an
+existing build folder.
 
 ## 5. Getting the same bytes
 
@@ -135,17 +138,13 @@ swap the prefix in your output before hashing (section 6 did this).
 ### 5.2 Version string
 
 Flycast's CMake runs `git describe --tags` at configure time and stores the
-result. The single-board tree, rebuilt from the patches with the committer
-settings above, is commit e2e54ca6c again, so the string matches.
+result. Both trees, rebuilt from the patches with the committer settings
+above, are commits 4cb999d50434 and b3e207a43bcf again, so the strings match.
 
-The five-board core was configured on 2026-11-02 at 21:41 UTC while its tree
-was commit 888703467 with the last three patches' changes present but not yet
-committed; they were committed eight minutes later as 421edb813, 21b2dcbec and
-0fb4009b4. Its version string therefore reads `v2.6-323-g888703467`. Git
-cannot recreate those commit hashes from patch files (the earlier commits on
-that branch were rebased, so their committer data differs), so a rebuild
-reports `v2.6-326-g<other hash>`. The code is the 0fb4009b4 tree; section 6
-shows the rest of the file is identical.
+(Until release `web-2026.11.05-1` the five-board core carried the string
+`v2.6-323-g888703467`, a commit that existed only on the build PC; section 6
+has the history. The cores of `web-2026.11.05-1` are built straight from the
+recipe, so this no longer applies.)
 
 ### 5.3 Line endings
 
@@ -206,6 +205,32 @@ repository alone (its code would not change).
 Not checked here: a build on another machine, on Linux, or with Flycast
 cloned from GitHub over the network.
 
+### 6.1 Reproduction check, 2026-11-05 (cores of `web-2026.11.05-1`)
+
+Done on the build PC, 2026-11-05, with its own fresh emsdk 3.1.74 (5.4), in a
+working folder at another path, with `__FILE__` paths mapped to
+`C:/dev/doc-browser-build/ext/wt-8412d3d8a` and `.../wt-linkbus2` through
+`EMCC_CFLAGS=-fmacro-prefix-map=...` (5.1), so the outputs are the files a
+build at `C:\dev\doc-browser-build\ext` gives:
+
+1. Flycast at 8412d3d8a391 with its pinned submodules, then the patch series
+   of this repository applied with `git am` as in section 4. HEAD came out as
+   4cb999d50434 (single-board) and b3e207a43bcf (five-board).
+2. `build-win.ps1` and the two link scripts of this repository (the link
+   scripts unchanged except that their output and source folders were pointed
+   at the working folder).
+3. Each core was built twice, in separate build folders; both builds gave the
+   same bytes.
+4. The same setup rebuilt the previously served single-board core (commit
+   e2e54ca6c, before patch 0023) byte for byte, as a check of the setup.
+5. `build-win.ps1 -CheckOnly` passed on both build folders (no GPL version 3
+   file among 2379 and 2383 compiled sources and headers) and failed on a
+   build of the previous five-board tree (it found `isofs.cpp.o`,
+   `achievements.cpp.o`, `iso9660.h` and `achievements.cpp`).
+
+The SHA-256 of each released core file is recorded in the deploy's
+`source-manifest.json` (section 7).
+
 ## 7. Release labels
 
 - Tag the doc-browser-source commit whose patch series and scripts built the deployed
@@ -236,35 +261,18 @@ cloned from GitHub over the network.
 |---|---|---|
 | xBRZ (GPL-3.0) | No | `-DUSE_XBRZ=OFF` (patch 0005); `xbrz.cpp` not in the build graph or the library |
 | Bundled third-party game data (flash images, F355 picture, printer fonts, BIOS font) | No | `-DUSE_BUNDLED_GAME_DATA=OFF` (patch 0006); `libflycast-resources.a` holds only the resource index and 8 translation files |
-| libcdio `iso9660.h` (GPL-3.0-or-later) | **Yes** | `core/imgread/isofs.cpp` includes it and is linked (used by the Dreamcast HLE BIOS disc boot in `core/reios/reios.cpp`). `-DUSE_LIBCDIO=OFF` only turns off upstream's optional CD-drive library; it does not touch this header |
+| libcdio `iso9660.h` (GPL-3.0-or-later) | No | Patch 0023: option `USE_ISOFS`, OFF by default for the libretro Emscripten build, leaves out `core/imgread/iso9660.h`, `isofs.cpp` and `isofs.h`; `reios_locate_bootfile` (Dreamcast disc boot only) refuses with an error. Not in either build's `build.ninja` or `ninja -t deps` |
+| DuckStation-derived `core/achievements/achievements.cpp` (GPL-3.0 OR CC-BY-NC-ND-4.0) | No | Patch 0023: the libretro build compiles `core/achievements/achievements_stub.cpp` (GPL-2.0-or-later, the savestate stub) instead. Before 0023 only the file's stub was compiled (no RetroAchievements in the libretro build) |
+| picoTCP (GPL-2.0-only OR GPL-3.0-only) | Yes | `core/deps/picotcp` is linked through `core/network/picoppp.cpp` (Dreamcast modem and network emulation). Compatible with GPL-2.0 and GPL-3.0 but not with "any later version". With the GPL version 3 sources gone (patch 0023), the combined cores are GPL-2.0, through picoTCP's version 2 option |
 | Unclear provenance, not needed for NAOMI: `core/reios/descrambl.cpp`, `core/deps/chdpsr/cdipsr.cpp` | **Yes** | both compiled and linked (reios disc boot; CDI disc images) |
 | Unclear provenance, needed for NAOMI: `core/hw/naomi/decrypt.cpp`, `core/hw/aica/dsp_interp.cpp` | Yes (kept on purpose) | NAOMI needs them |
 
-What would close the two open rows (a patch 0023 on `doc-wasm/8412d3d8a`,
-carried into `doc-wasm/linkbus2`, then a rebuild and a new tag):
+Patch 0023 closes the GPL version 3 rows. A NAOMI game never uses the ISO
+9660 reader: `reios_locate_bootfile` is reached only when
+`settings.platform.isConsole()`, and `reios_boot` loads a NAOMI game from the
+cartridge. The only other user of `IsoFs`, `core/ui/boxart/scraper.cpp`, is
+built only without `LIBRETRO`.
 
-1. A CMake option, for example `USE_DREAMCAST_DISC` (default ON, which keeps
-   upstream behaviour; `build-win.ps1` passes OFF), that leaves out
-   `core/imgread/isofs.cpp`, `core/reios/descrambl.cpp`, `core/imgread/cdi.cpp`
-   and `core/deps/chdpsr/*`, guards the disc-boot path in `core/reios/reios.cpp`
-   (`reios_locate_bootfile` and the descramble step) and the CDI entry in the
-   image driver table (`core/imgread/common.cpp`) with
-   `#ifdef USE_DREAMCAST_DISC`. NAOMI never boots through reios, so the game is
-   unaffected; a Dreamcast disc would no longer boot in the browser build.
-2. Or, to keep Dreamcast disc boot: replace `iso9660.h` with a short header of
-   our own (GPL-2.0-or-later) that declares only the ISO 9660 volume
-   descriptor and directory record layouts `isofs.cpp` uses, and still leave
-   out `descrambl.cpp` and `cdipsr.cpp` as in 1.
-3. Extend the archive check in `build-win.ps1` from `xbrz|libcdio` to also
-   refuse `isofs`, `descrambl`, `cdipsr` and `cdi.cpp` objects, so a regression
-   fails the build. The current check passes even though `isofs.cpp.o` carries
-   the libcdio header.
-
-Checked on 2026-11-03 against commit e2e54ca6c: the only users of `IsoFs`,
-`descrambl_buffer` and `cdi_parse` in the libretro build are
-`core/reios/reios.cpp` and `core/imgread/common.cpp` (`core/ui/boxart/scraper.cpp`
-also uses `IsoFs` but is built only when `LIBRETRO` is off). So option 1 is a
-small patch touching `CMakeLists.txt`, `core/imgread/CMakeLists.txt`,
-`core/reios/CMakeLists.txt`, `core/reios/reios.cpp` and
-`core/imgread/common.cpp`. It is not in the served cores yet: it changes them,
-so it lands with the next core rebuild, together with a new release tag.
+Still open: `core/reios/descrambl.cpp` and `core/deps/chdpsr/cdipsr.cpp`
+(unclear provenance, no licence header, not needed for NAOMI) are compiled
+and linked. A later patch can leave them out the same way.

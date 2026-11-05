@@ -36,10 +36,12 @@ output, and em or en dashes in our own text.
 ## Licence
 
 Our code and patches are GPL-2.0-or-later, the same as Flycast (`LICENSE`,
-GPL version 2). The served cores currently also contain libcdio's
-`iso9660.h`, which is GPL-3.0-or-later, so the combined cores are
-distributed under GPL-3.0-or-later (`LICENSE.GPL-3`) until a planned patch
-(0023, `SOURCE.md` section 8) takes that header out. See `COPYRIGHT`, and
+GPL version 2). The served cores also contain picoTCP, which is licensed
+under GPL version 2 or version 3 only, so each combined core is distributed
+under version 2 of the GNU General Public License (`LICENSE`). Patch 0023
+keeps the GPL version 3 sources (libcdio's `iso9660.h` and DuckStation's
+`achievements.cpp`) out of the cores; see `SOURCE.md` section 8. Each
+source file keeps its own licence. See `COPYRIGHT`, and
 `THIRD_PARTY_NOTICES.md` for the permissive third-party parts linked into
 the cores.
 

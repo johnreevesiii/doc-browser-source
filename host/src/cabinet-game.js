@@ -31,6 +31,7 @@
 import { startCabinet, cabinetBoards, isLinkedStatus } from './lb-cabinet.js';
 import { LeaseLostError } from './card-stable.js';
 import { createAudioOutput } from './audio-output.js';
+import { allocateInputBuffer, writeInputMask, clearInput, INPUT_PORTS } from './seat-feel.js';
 
 export const PLAYER_BOARD = 'board1';
 export const CABINET_PACE_HZ = 60;
@@ -138,18 +139,38 @@ export const AUDIO_REPORT_FRAMES = 8820;
 // a few seconds at boot). The master is kept in the race group in case it
 // has race sounds of its own (a linked race with entrants was not checked);
 // the master bus limiter (audio-output.js) keeps any doubling from clipping.
-export const AUDIO_SOURCES = Object.freeze({
+export const AUDIO_SOURCES_V1 = Object.freeze({
   [PLAYER_BOARD]: Object.freeze({ group: 'seat', primeFrames: SEAT_AUDIO_PRIME_FRAMES, maxBufferedFrames: SEAT_AUDIO_MAX_BUFFERED_FRAMES, reportEveryFrames: AUDIO_REPORT_FRAMES }),
   board0: Object.freeze({ group: 'race', primeFrames: AUDIO_PRIME_FRAMES, maxBufferedFrames: AUDIO_MAX_BUFFERED_FRAMES, targetFrames: RACE_AUDIO_TARGET_FRAMES, reportEveryFrames: AUDIO_REPORT_FRAMES }),
   partner: Object.freeze({ group: 'race', primeFrames: AUDIO_PRIME_FRAMES, maxBufferedFrames: AUDIO_MAX_BUFFERED_FRAMES, targetFrames: RACE_AUDIO_TARGET_FRAMES, reportEveryFrames: AUDIO_REPORT_FRAMES }),
 });
 
+// The sound path players get (2026-11-04, "sound is delayed and stutters"):
+// the context runs at the sound card's own rate and each source's worklet
+// converts from 44100 Hz itself with an adaptive set point
+// (audio-worklet.js ResamplingAudioProcessor): no browser resampler in front
+// of the speakers, a smooth rate trim instead of squeeze steps, a short
+// buffer that grows only on a machine that runs dry, and fades instead of
+// clicks. The seat hands over about 735 frames every vblank; its low point
+// sits near SEAT_AUDIO_TARGET_FRAMES (about 17 ms: enough for a vblank held
+// over to the next, which the measured seat does about 1 in 10); the race boards
+// hand over about 1470 every second vblank and keep RACE_AUDIO_TARGET_FRAMES.
+// AUDIO_SOURCES_V1 (the cap and set point modes at 44100 Hz) stays for
+// lab A/B runs.
+export const SEAT_AUDIO_TARGET_FRAMES = 768;
+export const AUDIO_SOURCES = Object.freeze({
+  [PLAYER_BOARD]: Object.freeze({ group: 'seat', resample: true, handoverFrames: 735, targetFrames: SEAT_AUDIO_TARGET_FRAMES, maxTargetFrames: 2048, boostFrames: 256, reportEveryFrames: AUDIO_REPORT_FRAMES }),
+  board0: Object.freeze({ group: 'race', resample: true, handoverFrames: 1470, targetFrames: RACE_AUDIO_TARGET_FRAMES, maxTargetFrames: 3072, boostFrames: 256, reportEveryFrames: AUDIO_REPORT_FRAMES }),
+  partner: Object.freeze({ group: 'race', resample: true, handoverFrames: 1470, targetFrames: RACE_AUDIO_TARGET_FRAMES, maxTargetFrames: 3072, boostFrames: 256, reportEveryFrames: AUDIO_REPORT_FRAMES }),
+});
+
 // Must be called from the Start click (the AudioContext needs a user
 // gesture); the context is created before the first await inside.
-export function openCabinetAudio() {
+// profile 'v1' (lab A/B only): the older 44100 Hz path.
+export function openCabinetAudio(profile = 'v2') {
+  const v1 = profile === 'v1';
   return createAudioOutput({
-    capacityFrames: 8192, sources: AUDIO_SOURCES,
-
+    capacityFrames: 8192, sources: v1 ? AUDIO_SOURCES_V1 : AUDIO_SOURCES, sampleRate: v1 ? undefined : 'native',
   }).catch(() => null);
 }
 
@@ -172,23 +193,43 @@ export function cabinetAudioBoards(audio) {
 // or 8; a missing seat canvas is drawn nowhere); link = { edition, sessionTag }
 // from edition-b.js linkTags (default: the lab's Edition A tags). Returns
 // { cabinet, inRace(), checkRace(), finish(), stop() }.
-export function startStableCabinet({ files, game, card, input, canvases, source, seats = 4, audio = null, link = null, say = () => {}, onStats = () => {}, onFailure = () => {}, log = () => {} }) {
+// feel (lab A/B only; the player page always takes the defaults):
+//   eventInput: key and pad changes reach the seat at once (true) instead of
+//               once per animation frame; taps shorter than a frame are kept
+//   lateLatch:  the seat board takes its input just before the hub releases
+//               its round (seat-feel.js); timing only
+//   traces:     { label: SharedArrayBuffer } run timing traces (feel-trace.js)
+export const DEFAULT_FEEL = Object.freeze({ eventInput: true, lateLatch: true });
+
+export function startStableCabinet({ files, game, card, input, canvases, source, seats = 4, audio = null, link = null, say = () => {}, onStats = () => {}, onFailure = () => {}, log = () => {}, feel = DEFAULT_FEEL, traces = {} }) {
   // The session can end while the page waits (the checkout, the sound): a
   // lost session never starts a cabinet that could not save.
   if (source && typeof source.state === 'function' && source.state() !== 'ready') {
     throw new LeaseLostError(typeof source.lostReason === 'function' ? source.lostReason() || 'lost' : 'lost');
   }
   if (!globalThis.crossOriginIsolated) throw new Error('not cross-origin isolated');
-  const inputSab = new SharedArrayBuffer(16);
+  const eventInput = feel.eventInput !== false;
+  // Live masks plus sticky pressed bits (seat-feel.js). The masks go to the
+  // seat as soon as they change (a key event, a pad poll), and once per
+  // animation frame as a backstop.
+  const inputSab = eventInput ? allocateInputBuffer() : new SharedArrayBuffer(16);
   const inputI32 = new Int32Array(inputSab);
   let running = true;
+  const sendInput = () => {
+    if (!running) return;
+    for (let p = 0; p < INPUT_PORTS; p++) {
+      if (eventInput) writeInputMask(inputI32, p, input.mask(p));
+      else Atomics.store(inputI32, p, input.mask(p));
+    }
+  };
+  const unlisten = eventInput && typeof input.onChange === 'function' ? input.onChange(sendInput) : () => {};
   const pump = () => {
     if (!running) return;
-    for (let p = 0; p < 4; p++) Atomics.store(inputI32, p, input.mask(p));
+    sendInput();
     requestAnimationFrame(pump);
   };
   requestAnimationFrame(pump);
-  const onBlur = () => { for (let p = 0; p < 4; p++) Atomics.store(inputI32, p, 0); };
+  const onBlur = () => clearInput(inputI32);
   addEventListener('blur', onBlur);
 
   let failed = false;
@@ -206,7 +247,7 @@ export function startStableCabinet({ files, game, card, input, canvases, source,
     cards: { [PLAYER_BOARD]: card.slice().buffer },
     watchCards: [PLAYER_BOARD], watchCap: 5000,
     onCardWrite: cardWriteHandler({ isRunning: () => running, source, log }),
-    input: inputSab, inputBoard: PLAYER_BOARD,
+    input: inputSab, inputBoard: PLAYER_BOARD, lateLatch: feel.lateLatch !== false, traces,
     audioBoards: cabinetAudioBoards(audio),
     ...(link ? { edition: link.edition, sessionTag: link.sessionTag } : {}),
     log,
@@ -258,7 +299,8 @@ export function startStableCabinet({ files, game, card, input, canvases, source,
     running = false;
     clearInterval(timer);
     removeEventListener('blur', onBlur);
-    for (let p = 0; p < 4; p++) Atomics.store(inputI32, p, 0);
+    unlisten();
+    clearInput(inputI32);
     try { cabinet.terminate(); } catch { /* already gone */ }
     if (audio && !keepAudio) { try { audio.close(); } catch { /* closed */ } }
   };

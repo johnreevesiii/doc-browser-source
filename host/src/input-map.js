@@ -64,6 +64,11 @@ export function createInputState(options = {}) {
   const keyMasks = new Uint16Array(MAX_PORTS);
   const padMasks = new Uint16Array(MAX_PORTS);
   let suspended = false;
+  // Change listeners (onChange): called after any mask may have changed, so
+  // a consumer can pass the new masks on at once instead of once per
+  // animation frame.
+  const listeners = new Set();
+  const changed = () => { for (const fn of listeners) { try { fn(); } catch { /* a listener's own problem */ } } };
 
   // Returns true when the key is mapped, so the caller can preventDefault.
   function onKey(code, down) {
@@ -72,8 +77,10 @@ export function createInputState(options = {}) {
     const id = keyboardMap[code];
     if (!Number.isInteger(id) || id < 0 || id > 15 || (BLOCKED_MASK >> id) & 1) return false;
     const bit = 1 << id;
+    const before = keyMasks[keyboardPort];
     if (down) keyMasks[keyboardPort] |= bit;
     else keyMasks[keyboardPort] &= ~bit;
+    if (keyMasks[keyboardPort] !== before) changed();
     return true;
   }
 
@@ -83,6 +90,12 @@ export function createInputState(options = {}) {
   // it at index 1 or later (an empty slot, or a non-standard device first).
   // Other pads are not read.
   function pollGamepads(pads) {
+    const before = padMasks.slice();
+    pollInto(pads);
+    for (let p = 0; p < MAX_PORTS; p++) if (padMasks[p] !== before[p]) { changed(); return; }
+  }
+
+  function pollInto(pads) {
     padMasks.fill(0);
     if (!pads || suspended) return;
     let port = 0;
@@ -117,6 +130,12 @@ export function createInputState(options = {}) {
   function releaseAll() {
     keyMasks.fill(0);
     padMasks.fill(0);
+    changed();
+  }
+
+  function onChange(fn) {
+    listeners.add(fn);
+    return () => listeners.delete(fn);
   }
 
   function setMaps(maps = {}) {
@@ -130,7 +149,7 @@ export function createInputState(options = {}) {
     releaseAll();
   }
 
-  return { onKey, pollGamepads, mask, inputState, releaseAll, setMaps, suspend, suspended: () => suspended };
+  return { onKey, pollGamepads, mask, inputState, releaseAll, setMaps, suspend, suspended: () => suspended, onChange };
 }
 
 // Wires DOM key events to an input state. Returns an unbind function.

@@ -93,11 +93,14 @@
 //   and play carries on. If no answer comes for a whole lease, the session
 //   ends with the connection named as the cause (MESSAGES.lostConnection).
 
+import { BUILDABLE, editionName } from './editions.js';
+
 export const STABLE_API = '/api/browser-cards';
 export const HANDOFF_KEY = 'doc.browserSession';
 export const DEFAULT_RETURN_PATH = '/stable/browser';
 export const CARD_BYTES = 207;
-export const EDITIONS = Object.freeze(['A', 'B']);
+// The editions a hand-off may carry: the ones this build can run (editions.js).
+export const EDITIONS = BUILDABLE;
 export const REQUEST_TIMEOUT_MS = 15000;
 // Heartbeat retry while the connection is down (the normal beat is heartbeat_s).
 export const RECONNECT_MS = 5000;
@@ -175,9 +178,8 @@ export class RestartRefusedError extends Error {
   }
 }
 
-// Player-facing edition names (doc-ops D-072; the same as edition-b.js EDITION_NAMES).
-const EDITION_LABEL = Object.freeze({ A: 'Rev C', B: 'Rev C Rebalanced' });
-const editionLabel = (e) => EDITION_LABEL[e] || 'another edition';
+// Player-facing edition names (editions.js; the same as edition-b.js EDITION_NAMES).
+const editionLabel = (e) => editionName(e) || 'another edition';
 
 export class EditionMismatchError extends Error {
   constructor(want, got) {
@@ -269,7 +271,7 @@ export function createStableCardSource({
   if (!handoff) throw new Error('no hand-off from the stable');
   if (typeof getAuthToken !== 'function') throw new Error('getAuthToken is required');
   if (typeof fetchImpl !== 'function') throw new Error('fetch is not available');
-  if (!EDITIONS.includes(expectEdition)) throw new Error('expectEdition must be A or B');
+  if (!EDITIONS.includes(expectEdition)) throw new Error(`expectEdition must be one of ${EDITIONS.join(', ')}`);
 
   const leaseMs = handoff.lease_s * 1000;
   const sessionHeader = `${handoff.session_id}.${handoff.token}`;

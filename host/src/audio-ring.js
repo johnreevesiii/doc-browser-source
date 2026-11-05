@@ -74,8 +74,24 @@ export class AudioRing {
   // Consumer only: drops up to frames of the oldest unplayed audio. Returns
   // frames dropped.
   skip(frames) {
-    const n = Math.max(0, Math.min(frames, this.available()));
+    const n = Math.max(0, Math.min(Math.floor(frames), this.available()));
     this.store(READ, (this.load(READ) + n) % (2 * this.capacity));
+    return n;
+  }
+
+  // Consumer only: up to count frames into left and right from index
+  // offset, as floats, with no allocation. No underrun is counted (the
+  // caller asks only for what is there). Returns frames read.
+  pullInto(left, right, offset, count) {
+    const n = Math.max(0, Math.min(count, this.available(), left.length - offset));
+    let r = this.load(READ);
+    for (let f = 0; f < n; f++) {
+      const slot = (r % this.capacity) * 2;
+      left[offset + f] = this.data[slot] / 32768;
+      right[offset + f] = this.data[slot + 1] / 32768;
+      r = (r + 1) % (2 * this.capacity);
+    }
+    this.store(READ, r);
     return n;
   }
 

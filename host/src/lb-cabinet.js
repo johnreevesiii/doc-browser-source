@@ -10,6 +10,8 @@
 
 import { MB, MB_TOTAL_BYTES, CABINET_TOTAL_BYTES, CABINET_SNAPSHOT_BYTES, EDITION_A, HUB_STATUS } from './lb-lockstep.js';
 import { MASTER, PARTNER, vblankNumber, createFramePairer } from './race-pair.js';
+import { NET_CTL, NET_STATUS, NET_MODES } from './lb-net-layout.js';
+import { PACE_WORDS } from './seat-feel.js';
 
 // The race screen's two page canvases (board0 left, partner right) show the
 // frames the two boards post, a matched pair per animation frame
@@ -114,12 +116,25 @@ export const isLinkedStatus = (comm2, seats = 4) => typeof comm2 === 'string' &&
 //   onRacePair:  diagnostics, every race pair shown (createRacePresenter)
 //   edition, sessionTag: the link's edition tag (1 = A, 2 = B) and session tag;
 //                every board and the hub get the same pair (edition-b.js linkTags)
+//   boardEditions: lab only, { label: tag } gives those boards another edition
+//                tag than the hub's, to check that the link refuses mixed
+//                editions (lab-game-set.js parseMixTag); default none
+//   lateLatch:   the input board starts each run just before the hub
+//                releases its round, so the input it takes is fresh
+//                (seat-feel.js createLateLatch); timing only, default off
+//   traces:      lab only, { label: SharedArrayBuffer } run timing trace of
+//                those boards (feel-trace.js)
 // Pacing: paceHz paces the hub (every seat one vblank per round, so 60 is
 // 60 guest vblanks a second per board); the boards themselves never sleep.
+// net (LAB ONLY, lb-net-delay.js): { mode: 'strict' | 'relaxed', up, down,
+//   jitter (ms per ring node), seed } runs the hub with the delay and jitter
+//   injector; setNet() changes the delays live, netStatus() reads its
+//   counters and restartBoard() stops a seat board and starts a fresh one
+//   (rejoin and takeover tests). Default null: the normal hub, unchanged.
 export function startCabinet({ files, game, canvases, seats = 4, frames = 3000, hashEvery = 60, pinTime = 1767225600,
   jitDet = 1, preserve = false, paceHz = 0, catchUpMs = 250, presses = {}, cards = {}, bank = 'snapshot', dynarec = 1, barrierTimeoutMs = 10000, yieldEvery = 1, verbose = false, log = () => {},
   input = null, inputBoard = 'board1', audio = null, audioBoard = 'board1', audioBoards = null, watchCards = [], onCardWrite = () => {}, onEvent = () => {}, watchCap = 0,
-  presentRace = true, onRacePair = null, edition = EDITION_A, sessionTag = SESSION_TAG }) {
+  presentRace = true, onRacePair = null, edition = EDITION_A, sessionTag = SESSION_TAG, boardEditions = {}, net = null, netWatch = false, lateLatch = false, traces = {} }) {
   const boards = cabinetBoards(seats);
   const n = seats + 1; // ring nodes: the master and the satellites
   const partnerIndex = boards.length - 1;
@@ -133,9 +148,31 @@ export function startCabinet({ files, game, canvases, seats = 4, frames = 3000, 
   const race = presentRace ? createRacePresenter(canvases[0], canvases[partnerIndex], onRacePair) : null;
   const mailboxes = Array.from({ length: n }, () => new SharedArrayBuffer(MB_TOTAL_BYTES));
   const cabinet = new SharedArrayBuffer(bank === 'live' ? CABINET_TOTAL_BYTES : CABINET_SNAPSHOT_BYTES);
-  const ctl = new SharedArrayBuffer(16);
+  const ctl = new SharedArrayBuffer(net ? NET_CTL.words * 4 : 16);
   const hubStatus = new SharedArrayBuffer(HUB_STATUS.words * 4);
+  const netStatusBuf = net ? new SharedArrayBuffer(NET_STATUS.words * 4) : null;
+  const ctlI32 = new Int32Array(ctl);
+  const writeNet = (cfg) => {
+    for (let i = 0; i < n; i++) {
+      Atomics.store(ctlI32, NET_CTL.up + i, Math.round(1000 * Number((cfg.up && cfg.up[i]) || 0)));
+      Atomics.store(ctlI32, NET_CTL.down + i, Math.round(1000 * Number((cfg.down && cfg.down[i]) || 0)));
+      Atomics.store(ctlI32, NET_CTL.jitter + i, Math.round(1000 * Number((cfg.jitter && cfg.jitter[i]) || 0)));
+    }
+    Atomics.add(ctlI32, NET_CTL.gen, 1);
+  };
+  if (net) {
+    const m = NET_MODES[net.mode];
+    if (!(m > 0)) throw new Error(`net.mode must be strict or relaxed, not ${net.mode}`);
+    ctlI32[NET_CTL.mode] = m;
+    ctlI32[NET_CTL.seed] = net.seed || 1;
+    writeNet(net);
+    // net.absent: satellite ring seats with no board at boot (late join test).
+    for (const i of net.absent || []) if (i >= 1 && i <= seats) ctlI32[NET_CTL.absent + i] = 1;
+  }
+  const absentAtBoot = (b) => !!(net && b.seat >= 1 && (net.absent || []).includes(b.seat));
   const frameCounts = new SharedArrayBuffer(4 * boards.length);
+  // The hub's schedule and each seat's barrier lateness (seat-feel.js).
+  const pace = new SharedArrayBuffer(PACE_WORDS * 8);
   const state = {
     started: performance.now(),
     seats,
@@ -152,12 +189,19 @@ export function startCabinet({ files, game, canvases, seats = 4, frames = 3000, 
     if (e.data.type === 'hub-error') { state.hub.error = e.data.message; log(`[hub] ${e.data.message}`); }
     if (e.data.type === 'hub-stopped') state.hub.stopped = true;
   };
-  hub.postMessage({ type: 'init', n, mailboxes, sessionTag, edition, status: hubStatus, ctl, frameCounts });
+  // The pace clock goes to the normal hub only: the lab net hub (runNet)
+  // never gets it, so its buffer stays zero and readPaceClock gives null
+  // there (in relaxed mode a tick is not a board's vblank); the seat's late
+  // latch then stays inert.
+  hub.postMessage({ type: 'init', n, mailboxes, sessionTag, edition, status: hubStatus, ctl, frameCounts, ...(net ? { netStatus: netStatusBuf } : { pace }) });
 
-  const workers = boards.map((b) => {
+  const workers = [];
+  // spawn(b, over): start board b's worker (over: restart overrides, lab only:
+  // { canvas, card, presses, frames }).
+  const spawn = (b, over = null) => {
     const w = new Worker(new URL('./lb-board-worker.js', import.meta.url), { type: 'module' });
-    const side = race ? raceSide(b.label) : -1;
-    const pageCanvas = canvases[b.index] || null;
+    const side = race && !over ? raceSide(b.label) : -1;
+    const pageCanvas = over ? (over.canvas || null) : (canvases[b.index] || null);
     const off = side < 0 && pageCanvas ? pageCanvas.transferControlToOffscreen() : null;
     const st = state.boards[b.index];
     w.onmessage = (e) => {
@@ -187,22 +231,27 @@ export function startCabinet({ files, game, canvases, seats = 4, frames = 3000, 
     };
     w.onerror = (e) => { st.errors.push(`worker error: ${e.message}`); log(`[${b.label}] worker error ${e.message}`); };
     const fileCopies = files.map(([name, bytes]) => [name, bytes.slice(0)]);
+    const card = over && Object.hasOwn(over, 'card') ? over.card : cards[b.label];
     w.postMessage({
       type: 'init', label: b.label, index: b.index, boardId: b.boardId, seat: b.seat, n,
-      actAsServer: b.actAsServer, multiboardSlaves: b.multiboardSlaves, edition, sessionTag,
+      actAsServer: b.actAsServer, multiboardSlaves: b.multiboardSlaves, edition: Object.hasOwn(boardEditions, b.label) ? boardEditions[b.label] : edition, sessionTag,
       mailbox: b.seat >= 0 ? mailboxes[b.seat] : null, cabinet: b.cabinet ? cabinet : null,
       canvas: off, files: fileCopies, game, frames, hashEvery, pinTime, jitDet, preserve, bank, dynarec, barrierTimeoutMs,
-      ctl, frameCounts, hubStatus, autoStart: b.boardId === 0, realtimeHz: 0, presses: presses[b.label] || [], yieldEvery, verbose,
-      card: cards[b.label] ? cards[b.label].slice(0) : null, watchCard: watchCards.includes(b.label),
+      ctl, frameCounts, hubStatus, autoStart: b.boardId === 0, realtimeHz: 0, presses: (over && over.presses) || presses[b.label] || [], yieldEvery, verbose,
+      card: card ? card.slice(0) : null, watchCard: watchCards.includes(b.label), netWatch,
       input: input && b.label === inputBoard ? input : null,
+      pace, lateLatch: !!(lateLatch && input && b.label === inputBoard),
+      trace: Object.hasOwn(traces, b.label) ? traces[b.label] : null,
       audio: rings[b.label] || null,
       present: side >= 0 ? { width: pageCanvas ? pageCanvas.width : 640, height: pageCanvas ? pageCanvas.height : 480 } : null,
       // Not a race screen board and no page canvas: the worker draws into a
       // canvas of its own that is never shown.
       hidden: side < 0 && !pageCanvas,
     }, [...(off ? [off] : []), ...fileCopies.map(([, a]) => a)]);
+    workers[b.index] = w;
     return w;
-  });
+  };
+  for (const b of boards) if (!absentAtBoot(b)) spawn(b);
 
   const hubI32 = new Int32Array(hubStatus);
   const counts = new Int32Array(frameCounts);
@@ -236,12 +285,62 @@ export function startCabinet({ files, game, canvases, seats = 4, frames = 3000, 
     // the card copy included).
     terminate() {
       this.stop();
-      for (const w of workers) w.terminate();
+      for (const w of workers) if (w) w.terminate();
       hub.terminate();
       if (race) race.stop();
     },
     // Race screen presentation counts (race-pair.js), or null.
     raceStats: () => (race ? race.stats() : null),
+    // LAB ONLY (net option). Live delay change: { up, down, jitter } in ms per ring node.
+    setNet(cfg) { if (!net) throw new Error('not a net run'); writeNet(cfg); },
+    // LAB ONLY: the injector hub's counters (lb-net-layout.js NET_STATUS).
+    netStatus() {
+      if (!netStatusBuf) return null;
+      const a = new Int32Array(netStatusBuf);
+      const g = (i) => Atomics.load(a, i);
+      const per = (base) => Array.from({ length: n }, (_, i) => g(base + i));
+      const S = NET_STATUS;
+      return { tick: g(S.tick), mode: g(S.mode), running: g(S.running), waitingSeat: g(S.waitingSeat), ageAvgMs: g(S.ageAvgUs) / 1000,
+        ageMaxMs: g(S.ageMaxUs) / 1000, slotSize: g(S.slotSize), lateResets: g(S.lateResets), gen: g(S.gen),
+        txFrames: per(S.txFrames), txBytes: per(S.txBytes), changedBytes: per(S.changedBytes), deltaBytes: per(S.deltaBytes),
+        deliveries: per(S.deliveries), rxBytes: per(S.rxBytes), released: per(S.released), absentSeen: per(S.absentSeen), backlog: per(S.backlog) };
+    },
+    // LAB ONLY (net option): stop seat board `label` and start a fresh one in
+    // its slot (a player leaving and a browser joining). The hub skips the
+    // seat while it is stopped; its mailbox is cleared before the new board
+    // starts. over: { canvas, card (ArrayBuffer or null), presses, frames }.
+    // Resolves when the new board has installed its mailbox.
+    async restartBoard(label, over = {}, { downMs = 0 } = {}) {
+      if (!net) throw new Error('restartBoard needs the net option');
+      const b = boards.find((x) => x.label === label);
+      if (!b || b.seat <= 0) throw new Error(`${label} is not a satellite`);
+      const i = b.seat;
+      Atomics.store(ctlI32, NET_CTL.absent + i, 1);
+      const nsI32 = new Int32Array(netStatusBuf);
+      const t0 = performance.now();
+      while (Atomics.load(nsI32, NET_STATUS.absentSeen + i) !== 1) {
+        if (performance.now() - t0 > 5000) throw new Error('hub did not see the seat leave');
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      const old = workers[b.index];
+      if (old) { old.onmessage = null; old.terminate(); }
+      const prev = state.boards[b.index];
+      state.restarts = state.restarts || [];
+      state.restarts.push({ label, at: performance.now() - state.started, prevFrames: Atomics.load(counts, b.index), prevWatch: prev.watch.length });
+      if (downMs > 0) await new Promise((r) => setTimeout(r, downMs));
+      const mb = new Int32Array(mailboxes[i], 0, MB.headerBytes >> 2);
+      for (let k = 0; k < mb.length; k++) Atomics.store(mb, k, 0);
+      Atomics.store(counts, b.index, 0);
+      state.boards[b.index] = { label, ready: false, loaded: false, done: null, samples: [], errors: [], logs: [], startedAt: 0, watch: [], generation: (prev.generation || 0) + 1, previous: { watch: prev.watch, samples: prev.samples, errors: prev.errors } };
+      spawn(b, over);
+      const t1 = performance.now();
+      while (!state.boards[b.index].ready) {
+        if (state.boards[b.index].errors.length || performance.now() - t1 > 60000) throw new Error(`new ${label} did not start`);
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      Atomics.store(ctlI32, NET_CTL.absent + i, 0);
+      return { label, generation: state.boards[b.index].generation };
+    },
     setPace(hz) { Atomics.store(new Int32Array(ctl), 1, hz > 0 ? Math.round(1e6 / hz) : 0); },
     // Stop: the board loops end, the vblank barriers are released, and the
     // partner is asked to exit at its next multiboard barrier.

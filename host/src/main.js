@@ -11,6 +11,7 @@ import { createCardStore, createLocalLabCardSource, checkCardName, checkCardSize
 import { takeHandoff, createStableCardSource, MESSAGES as STABLE_MESSAGES, EditionMismatchError, CardUnavailableError, DEFAULT_RETURN_PATH } from './card-stable.js';
 import { loadMix, saveMix, toPercent } from './audio-mix.js';
 import { verifySetup, editionProblem, pageEdition, SETUP_MESSAGES } from './rom-setup.js';
+import { editionDef } from './editions.js';
 import { editionFiles, linkTags, EditionImageError, EditionBrowserError, editionBrowserProblem, EDITION_NAMES, EDITION_MESSAGES } from './edition-b.js';
 import { createTokenProvider } from './stable-auth.js';
 import { startStableCabinet, openCabinetAudio, boardLabels, playerPageSeats, PLAYER_BOARD } from './cabinet-game.js';
@@ -532,7 +533,7 @@ async function stableMode() {
     stableSay(msg);
     showBack();
   };
-  const check = await verifySetup({ expected: handoff.rom_sha256 });
+  const check = await verifySetup({ expected: handoff.rom_sha256, edition });
   if (!check.ok) { await refuse(SETUP_MESSAGES[check.reason]); return; }
   const why = editionProblem(handoff.edition, check.setup);
   if (why) { await refuse(SETUP_MESSAGES[why]); return; }
@@ -543,7 +544,7 @@ async function stableMode() {
   // the hash of the image the boards run (edition-b.js linkTags).
   let builtGame = null;
   let joinHash = check.setup.files.find((f) => f.role === 'game').sha256;
-  if (edition === 'B') {
+  if (editionDef(edition).build === 'edition-b') {
     // A browser that can't build B is told so, never that his files are wrong (EditionBrowserError).
     if (editionBrowserProblem()) { await refuse(EDITION_MESSAGES.browser); return; }
     stableSay(EDITION_MESSAGES.build);

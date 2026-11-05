@@ -9,7 +9,7 @@
 // can set the race audio and the seat sounds apart (audio-mix.js).
 
 import { AudioRing, allocateRingBuffer } from './audio-ring.js';
-import { PROCESSOR_NAME } from './audio-worklet.js';
+import { PROCESSOR_NAME, RESAMPLER_NAME } from './audio-worklet.js';
 
 // Flycast's libretro core reports 44100 Hz.
 export const CORE_SAMPLE_RATE = 44100;
@@ -29,9 +29,12 @@ export const DEFAULT_CAPACITY_FRAMES = 4096;
 export async function createAudioOutput(options = {}) {
   const Ctx = options.AudioContext || globalThis.AudioContext;
   if (!Ctx) throw new Error('Web Audio is not available');
-  const sampleRate = options.sampleRate || CORE_SAMPLE_RATE;
+  // sampleRate 'native': the sound card's own rate (sources with resample
+  // convert from the core's rate themselves, audio-worklet.js); otherwise
+  // the core's 44100 Hz and the browser resamples.
+  const sampleRate = options.sampleRate === 'native' ? undefined : options.sampleRate || CORE_SAMPLE_RATE;
   const capacityFrames = options.capacityFrames || DEFAULT_CAPACITY_FRAMES;
-  const ctx = new Ctx({ sampleRate, latencyHint: 'interactive' });
+  const ctx = new Ctx(sampleRate ? { sampleRate, latencyHint: 'interactive' } : { latencyHint: 'interactive' });
   const moduleUrl = options.moduleUrl || new URL('./audio-worklet.js', import.meta.url);
   await ctx.audioWorklet.addModule(moduleUrl);
   const Node = options.AudioWorkletNode || globalThis.AudioWorkletNode;
@@ -58,13 +61,23 @@ export async function createAudioOutput(options = {}) {
     const reportEveryFrames = spec.reportEveryFrames ?? options.reportEveryFrames ?? 0;
     const buffer = allocateRingBuffer(capacityFrames);
     const ring = new AudioRing(buffer, capacityFrames);
-    const node = new Node(ctx, PROCESSOR_NAME, {
-      numberOfInputs: 0,
-      numberOfOutputs: 1,
-      outputChannelCount: [2],
-      processorOptions: { buffer, capacityFrames, maxBufferedFrames: cap, primeFrames: prime, targetFrames: target, reportEveryFrames },
-    });
-    const src = { buffer, ring, group: spec.group ?? null, stats: { underruns: 0, buffered: 0, trimmed: 0, stretched: 0, skipped: 0, low: 0, high: 0, avg: 0 } };
+    // resample (audio-worklet.js ResamplingAudioProcessor): the core's rate
+    // converted to the context's, with an adaptive set point.
+    const node = spec.resample
+      ? new Node(ctx, RESAMPLER_NAME, {
+        numberOfInputs: 0,
+        numberOfOutputs: 1,
+        outputChannelCount: [2],
+        processorOptions: { buffer, capacityFrames, inRate: CORE_SAMPLE_RATE, outRate: ctx.sampleRate, targetFrames: target,
+          maxTargetFrames: spec.maxTargetFrames ?? 0, handoverFrames: spec.handoverFrames ?? 0, boostFrames: spec.boostFrames ?? 256, boostDecaySeconds: spec.boostDecaySeconds ?? 30, reportEveryFrames },
+      })
+      : new Node(ctx, PROCESSOR_NAME, {
+        numberOfInputs: 0,
+        numberOfOutputs: 1,
+        outputChannelCount: [2],
+        processorOptions: { buffer, capacityFrames, maxBufferedFrames: cap, primeFrames: prime, targetFrames: target, reportEveryFrames },
+      });
+    const src = { buffer, ring, group: spec.group ?? null, stats: { underruns: 0, buffered: 0, trimmed: 0, stretched: 0, skipped: 0, low: 0, high: 0, avg: 0 }, resample: !!spec.resample };
     if (node.port) node.port.onmessage = (e) => { if (e && e.data) Object.assign(src.stats, e.data); };
     if (sourceGroups) {
       const group = spec.group;
@@ -101,7 +114,7 @@ export async function createAudioOutput(options = {}) {
     stats: () => Object.fromEntries([...sources].map(([k, s]) => [k, { group: s.group, ...s.stats }])),
     // The context's own delay to the speakers, in seconds (0 where the
     // browser does not say).
-    latency: () => ({ base: Number(ctx.baseLatency) || 0, output: Number(ctx.outputLatency) || 0 }),
+    latency: () => ({ base: Number(ctx.baseLatency) || 0, output: Number(ctx.outputLatency) || 0, rate: ctx.sampleRate }),
     close: () => ctx.close(),
   };
 }

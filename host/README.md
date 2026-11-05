@@ -24,7 +24,7 @@ The page needs cross-origin isolation (COOP `same-origin`, COEP
 
 | Folder | Contents |
 |---|---|
-| `src/` | Page modules: game file store and setup check, input, audio, video, core bridge, card store and the stable card source, the linked cabinet (`lb-*.js`, `cabinet-game.js`; four seats on the served page), and the Rev C Rebalanced build (`edition-b.js` with its recipe `edition-b-spec.js`: the edition is built in the player's browser from the player's own stock game file), the edition registry (`editions.js`, `lab-game-set.js`), and seat input timing with its trace (`seat-feel.js`, `feel-trace.js`) |
+| `src/` | Page modules: game file store and setup check, input, audio, video, core bridge, card store and the stable card source, the linked cabinet (`lb-*.js`, `cabinet-game.js`; four seats on the served page), the Rev C Rebalanced build (`edition-b.js` with its recipe `edition-b-spec.js`: the edition is built in the player's browser from the player's own stock game file), the edition registry (`editions.js`, `lab-game-set.js`), and seat input timing with its trace (`seat-feel.js`, `feel-trace.js`) |
 | `shim/` | C/C++ linked into the cores: the libretro front end (`libretro_shim.c`), core options, debug state reads, and the LinkBus glue for the five-board core |
 
 The player supplies the game files, which stay in the browser. Nothing here

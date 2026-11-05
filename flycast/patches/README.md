@@ -5,7 +5,7 @@ Copyright (C) 2026 John R Reeves III. GPL-2.0-or-later, like the code it carries
 Base: upstream Flycast 8412d3d8a391 (https://github.com/flyinghead/flycast).
 Patches 0001 to 0003 port flycast-wasm 16e9c7b by nasomers
 (https://github.com/nasomers/flycast-wasm, GPL-2.0) onto that base. The rest
-are ours. Applied in order with `git am` they give commit e2e54ca6cc5e, the
+are ours. Applied in order with `git am` they give commit 4cb999d50434, the
 source of the served single-board core. The five-board core applies
 `../patches-linkbus2/` on top. How to apply and build: `../../SOURCE.md`.
 
@@ -33,3 +33,4 @@ source of the served single-board core. The five-board core applies
 | 0020 | rec-wasm: run every single-instruction interpreter step under the ifb guard |
 | 0021 | rec-wasm: fix the ifb guard comment about the insurance tick |
 | 0022 | rec-wasm: do not exempt T from the loop-carried register test |
+| 0023 | build: leave GPL-3.0 sources out of the libretro browser build (the ISO 9660 reader with libcdio's `iso9660.h`, and DuckStation's `achievements.cpp`; see `../../SOURCE.md` section 8) |

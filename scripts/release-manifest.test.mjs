@@ -47,8 +47,8 @@ test('readCores refuses a deploy without the cores', () => {
 
 test('buildManifest links the tag, not a moving branch', () => {
   const m = buildManifest({ cores: [], tag: 'web-2026.11.03-1', commit: 'a'.repeat(40), repoUrl: 'https://example.invalid/doc-web', now: new Date(0) });
-  assert.equal(m.license, 'GPL-3.0-or-later');
-  assert.equal(m.source.licence_text, 'https://example.invalid/doc-web/blob/web-2026.11.03-1/LICENSE.GPL-3');
+  assert.equal(m.license, 'GPL-2.0-only');
+  assert.equal(m.source.licence_text, 'https://example.invalid/doc-web/blob/web-2026.11.03-1/LICENSE');
   assert.equal(m.source.browse, 'https://example.invalid/doc-web/tree/web-2026.11.03-1');
   assert.equal(m.source.how_to_build, 'https://example.invalid/doc-web/blob/web-2026.11.03-1/SOURCE.md');
   assert.equal(m.generated_utc, '1970-01-01T00:00:00Z');

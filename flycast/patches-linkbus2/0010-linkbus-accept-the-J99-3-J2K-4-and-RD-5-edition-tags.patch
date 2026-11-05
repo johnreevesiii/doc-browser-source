@@ -1,0 +1,58 @@
+From e7b41a27172e6f090960fbf58837b843fca338eb Mon Sep 17 00:00:00 2001
+From: John R Reeves III <johnreevesiii@outlook.com>
+Date: Wed, 4 Nov 2026 16:03:26 -0800
+Subject: [PATCH] linkbus: accept the J99 (3), J2K (4) and RD (5) edition tags
+
+The browser edition registry (doc-web host/src/editions.js) gives DOC '99
+(derbyoc) link tag 3, DOC 2000 (derbyo2k) tag 4 and Rev D (derbyocw)
+tag 5. linkbus_install_mailbox refused every tag other than A (1) and
+B (2). One change for all three, replacing the separate J2K (4ee590633)
+and Rev D (doc-web PR #8) drafts. Frames whose tag differs from the
+board's own are still dropped and counted (badEdition).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MGX7KQ5gfrWApgW64pZbQ5
+---
+ core/network/linkbus.h       | 10 ++++++++++
+ core/network/linkbus_web.cpp |  2 +-
+ 2 files changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/core/network/linkbus.h b/core/network/linkbus.h
+index 14a2294ad..39259ac7e 100644
+--- a/core/network/linkbus.h
++++ b/core/network/linkbus.h
+@@ -55,8 +55,18 @@ enum class Edition : u8
+ 	Unknown = 0,
+ 	A = 1,	// stock Rev C
+ 	B = 2,	// Rev C plus FIXROM Q01, Q04, Q17
++	J99 = 3,	// DOC '99 (derbyoc), stock image
++	J2K = 4,	// DOC 2000 (derbyo2k), stock image
++	RD = 5,	// World Edition EX Rev D (derbyocw), stock image
+ };
+ 
++// True for the edition tags this core accepts (the browser edition registry, doc-web host/src/editions.js).
++inline bool linkbusEditionKnown(int e)
++{
++	return e == (int)Edition::A || e == (int)Edition::B || e == (int)Edition::J99
++		|| e == (int)Edition::J2K || e == (int)Edition::RD;
++}
++
+ // ---------------------------------------------------------------------------
+ // Part 1: ring (replaces NaomiNetwork as used by NaomiM3Comm)
+ // ---------------------------------------------------------------------------
+diff --git a/core/network/linkbus_web.cpp b/core/network/linkbus_web.cpp
+index 2b3053b21..9a1a4830a 100644
+--- a/core/network/linkbus_web.cpp
++++ b/core/network/linkbus_web.cpp
+@@ -663,7 +663,7 @@ EMSCRIPTEN_KEEPALIVE int linkbus_install_mailbox(int slotId, int slotCount, int
+ {
+ 	if (slotCount < 2 || slotCount > kMaxRingNodes || slotId < 0 || slotId >= slotCount)
+ 		return 1;
+-	if (edition != (int)Edition::A && edition != (int)Edition::B)
++	if (!linkbusEditionKnown(edition))
+ 		return 2;
+ 	if (!lb_mb_ok((int)MailboxLayout::totalBytes))
+ 		return 3;
+-- 
+2.56.0.windows.3
+

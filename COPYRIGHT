@@ -17,9 +17,9 @@ Scope
 -----
 John R Reeves III holds the copyright in the code and documents written for
 this project: host/, stubs/, scripts/, and our own changes in the patch
-series under flycast/patches/ (patches 0004 to 0022, and the conflict
+series under flycast/patches/ (patches 0004 to 0023, and the conflict
 resolutions and removals in 0001 and 0003) and flycast/patches-linkbus2/
-(patches 0001 to 0009).
+(patches 0001 to 0010).
 
 Third-party code
 ----------------
@@ -39,13 +39,14 @@ third-party libraries linked into the cores and their licences.
 
 Licence of the served cores
 ---------------------------
-The served cores currently also contain libcdio's core/imgread/iso9660.h
-(carried in upstream Flycast), which is GPL-3.0-or-later. The combined cores
-are therefore distributed under the GNU General Public License, version 3 or
-(at your option) any later version, until a planned patch (0023, SOURCE.md
-section 8) takes that header out of the build. The full text of version 3 is
-in the file LICENSE.GPL-3. Our own code and patches stay GPL-2.0-or-later,
-which permits this.
+The served cores contain picoTCP (core/deps/picotcp), which is licensed
+under GPL version 2 or version 3 only. Every other part allows GPL version
+2: Flycast and our code are version 2 or later, flycast-wasm is GPL-2.0,
+and the rest is permissive or allows version 2. So each combined core is
+distributed under the GNU General Public License, version 2 (the file
+LICENSE). Patch 0023 (SOURCE.md section 8) keeps libcdio's iso9660.h and
+DuckStation's achievements.cpp, which are GPL version 3, out of the
+cores. Our own code and patches stay GPL-2.0-or-later.
 
 No ROM
 ------

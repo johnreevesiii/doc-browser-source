@@ -98,8 +98,8 @@ export function buildManifest({ cores, tag, commit, repoUrl, now = new Date() })
   return {
     schema: 1,
     name: 'Derby Owners Club browser cores (Flycast for WebAssembly)',
-    // GPL-3.0-or-later while the cores carry libcdio's iso9660.h (COPYRIGHT).
-    license: 'GPL-3.0-or-later',
+    // GPL-2.0: picoTCP (GPL-2.0-only OR GPL-3.0-only) allows no later version (COPYRIGHT).
+    license: 'GPL-2.0-only',
     built_on: 'Flycast, https://github.com/flyinghead/flycast, upstream commit 8412d3d8a',
     source: {
       repository: repoUrl,
@@ -109,7 +109,7 @@ export function buildManifest({ cores, tag, commit, repoUrl, now = new Date() })
       archive: `${repoUrl}/archive/${ref}.zip`,
       how_to_build: `${repoUrl}/blob/${ref}/SOURCE.md`,
       notices: `${repoUrl}/blob/${ref}/THIRD_PARTY_NOTICES.md`,
-      licence_text: `${repoUrl}/blob/${ref}/LICENSE.GPL-3`,
+      licence_text: `${repoUrl}/blob/${ref}/LICENSE`,
       licence_text_gpl2: `${repoUrl}/blob/${ref}/LICENSE`,
     },
     generated_utc: now.toISOString().replace(/\.\d{3}Z$/, 'Z'),

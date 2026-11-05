@@ -25,11 +25,15 @@
 // boards running different images never share a link.
 
 import { EDITION_B_SPEC_JSON } from './edition-b-spec.js';
+import { EDITION_REGISTRY, editionDef, isBuildable } from './editions.js';
 
-// Player-facing names. The internal edition ids stay 'A' and 'B'.
-export const EDITION_NAMES = Object.freeze({ A: 'Rev C', B: 'Rev C Rebalanced' });
-// The LinkBus edition tag (linkbus/linkbus.h enum Edition): 1 = A, 2 = B.
-export const LINK_EDITION = Object.freeze({ A: 1, B: 2 });
+// Player-facing names for every registered edition (editions.js). The
+// internal ids stay 'A', 'B', and so on.
+export const EDITION_NAMES = Object.freeze(Object.fromEntries(EDITION_REGISTRY.map((e) => [e.id, e.name])));
+// The LinkBus edition tag (linkbus/linkbus.h enum Edition) of each edition
+// this build can run: 1 = A, 2 = B. Reserved tags of editions not yet
+// buildable are left out, so no page builds link tags the core refuses.
+export const LINK_EDITION = Object.freeze(Object.fromEntries(EDITION_REGISTRY.filter((e) => e.buildable).map((e) => [e.id, e.linkTag])));
 
 export class EditionSpecError extends Error {}
 export class EditionImageError extends Error {}
@@ -360,14 +364,15 @@ export async function editionZip(spec, zip, subtle = defaultSubtle()) {
  * read(name) returns the stored file's bytes (rom-store.js read).
  */
 export async function editionFiles({ edition, setup, read, spec = null, subtle = defaultSubtle() }) {
-  if (edition !== 'A' && edition !== 'B') throw new EditionImageError('unknown edition');
+  if (!isBuildable(edition)) throw new EditionImageError('unknown edition');
+  const rebuilt = editionDef(edition).build === 'edition-b';
   const game = setup.files.find((f) => f.role === 'game');
   if (!game) throw new EditionImageError('no game file is set up');
   const files = [];
-  let joinHash = edition === 'A' ? game.sha256 : null;
+  let joinHash = rebuilt ? null : game.sha256;
   for (const f of setup.files) {
     let bytes = await read(f.name);
-    if (edition === 'B' && f.role === 'game') {
+    if (rebuilt && f.role === 'game') {
       bytes = await editionZip(spec || shippedSpec(), bytes, subtle);
       joinHash = await sha256Hex(bytes, subtle);
     }

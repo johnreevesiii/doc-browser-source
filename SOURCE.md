@@ -25,7 +25,7 @@ beside it:
 | Five-board | `src/lb/core/flycast_libretro.js`, `src/lb/core/flycast_libretro.wasm` | the linked five-board cabinet on one page (boards run in workers); a stable game runs on this core |
 
 The page's own JavaScript is `host/src/` of this repository, served as
-written (no build step). The four `lb-*.js` modules are deployed one folder
+written (no build step). The six `lb-*.js` modules are deployed one folder
 down, in `src/lb/`, with their relative imports adjusted to match;
 `host/README.md` gives the mapping. Nothing else is changed.
 

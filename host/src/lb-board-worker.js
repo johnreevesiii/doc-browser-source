@@ -19,11 +19,21 @@ import { FS_PATHS, DEFAULT_CORE_OPTIONS, mountRom } from './core-bridge.js';
 import { mountCard, createCardWatcher } from './card-store.js';
 import { AudioRing } from './audio-ring.js';
 import { syncHeaderOffset } from './race-pair.js';
+import { takeInputMask, readPaceClock, readSeatLate, createLateLatch, absNowMs } from './seat-feel.js';
+import { traceWrite } from './feel-trace.js';
 
 // Game state words watched every frame (addresses from tools/probe-page.mjs
 // WATCH, Rev C): only changes are reported, as [frame, name, value].
 const WATCH = [['scene', 0x0C21A0F0], ['state', 0x0C21A2A8], ['role', 0x0C21A134], ['race_on', 0x0C3C12B8],
   ['recv_state', 0x0C21A2AC], ['phase', 0x0C21A284], ['done_mask', 0x0C21A278], ['rec_104', 0x0C21A610]];
+// LAB ONLY (net delay experiment, msg.netWatch): the game's link watchdog
+// (doc-ops research/claude/a04-link-timing: NETWORK ERROR flag 0x0C3B7748,
+// set after more than 32 polls with an unchanged comm packet number; poll
+// count 0x0C40A1B8), Rev C addresses. net_err is watched like the words
+// above; the poll count is reported as its maximum per 60 frames (wd_max),
+// only when above 1.
+const NET_ERR = 0x0C3B7748;
+const WD_COUNT = 0x0C40A1B8;
 
 const BIOS = new Set(['naomi.zip', 'naomi2.zip', 'awbios.zip', 'dc_boot.bin', 'dc_flash.bin']);
 const hex32 = (v) => (v >>> 0).toString(16).padStart(8, '0');
@@ -47,6 +57,12 @@ let rendered = false;
 // (ab), so the page can line the picture up with its sound (diagnostics).
 let audioRing = null;
 let audioBatches = 0;
+// Absolute time of the first linkbus post (slot frame, right after the
+// vblank barrier) since the current retro_run began; 0 for none yet.
+let firstPostAt = 0;
+// Absolute time the current run first entered the vblank barrier (0 none).
+let barrierAt = 0;
+let tracking = false;
 
 // After a retro_run on a race screen board: a newly drawn frame goes to the
 // page with its frame count and sync index; nothing is posted for a run
@@ -156,8 +172,26 @@ async function init(msg) {
     cabinet: msg.cabinet || undefined,
     // The core posts linkbus-tx after every slot frame; only the partner
     // start request matters to the page.
-    post: (m) => { if (m && m.type === 'linkbus-start-partners') post('start-partners', { slaves: m.slaves }); },
+    post: (m) => {
+      if (tracking && firstPostAt === 0) firstPostAt = absNowMs();
+      if (m && m.type === 'linkbus-start-partners') post('start-partners', { slaves: m.slaves });
+    },
   };
+  // Barrier entry time for the seat's late latch and the lab trace: the
+  // core's vblank barrier glue (linkbus_web.cpp lb_vb_barrier) reads
+  // Module.linkbus._vbI32 once per vblank, so an accessor on it marks the
+  // moment this board reached its barrier. Timing only; the value it hands
+  // back is the glue's own cached view. A core whose glue no longer reads it
+  // simply gives no barrier times (the latch then keeps its start lead and
+  // the hub's lateness reports).
+  if (msg.seat >= 0 && ((msg.lateLatch && msg.pace) || msg.trace)) {
+    let cached;
+    Object.defineProperty(Module.linkbus, '_vbI32', {
+      configurable: true,
+      get() { if (tracking && barrierAt === 0) barrierAt = absNowMs(); return cached; },
+      set(v) { cached = v; },
+    });
+  }
   for (const [name, bytes] of msg.files) {
     const u8 = new Uint8Array(bytes);
     if (BIOS.has(name.toLowerCase())) {
@@ -222,23 +256,53 @@ async function runBoard() {
   const frameCounts = new Int32Array(msg.frameCounts);
   const sleeper = new Int32Array(new SharedArrayBuffer(4));
   const presses = msg.presses || [];
-  // Live input (the player's seat): Int32 joypad masks for ports 0..3, written by the page.
+  // Live input (the player's seat): Int32 joypad masks for ports 0..3 and
+  // their sticky pressed bits (seat-feel.js), written by the page.
   const live = msg.input ? new Int32Array(msg.input) : null;
+  // Late latch (the player's seat on a paced cabinet): start each run just
+  // before the hub releases its round, so the input it takes is fresh.
+  // Wall-clock only: the frames and the inputs they read are unchanged.
+  const pace = msg.pace ? new BigInt64Array(msg.pace) : null;
+  const latch = pace && msg.lateLatch && msg.seat >= 0 ? createLateLatch() : null;
+  // Lab timing trace (feel-trace.js), never on a player page.
+  const trace = msg.trace ? new Float64Array(msg.trace) : null;
+  tracking = !!(latch || trace);
   const yieldEvery = Math.max(1, msg.yieldEvery || 1);
   let runMs = 0;
   const tStart = performance.now();
   let nextDue = 0;
-  const prev = WATCH.map(() => null);
+  const watch = msg.netWatch ? [...WATCH, ['net_err', NET_ERR]] : WATCH;
+  const prev = watch.map(() => null);
+  let wdMax = 0;
   let changes = [];
   // Seats: guest vblank count (vblank barrier), recorded with each watched change.
   const vbI32 = msg.mailbox ? new Int32Array(msg.mailbox, 0, 16) : null;
   for (let f = 0; ; f++) {
     if (Atomics.load(ctl, 0)) break;
+    let dueAbs = 0;
+    if (latch || trace) {
+      const clock = pace ? readPaceClock(pace) : null;
+      // The next barrier this run reaches is vblank vb + 1, released at
+      // t0 + (vb + 1) * period.
+      if (clock && vbI32) dueAbs = clock.t0Ms + (Atomics.load(vbI32, 8) + 1) * clock.periodMs;
+    }
+    if (latch && dueAbs > 0) {
+      const wait = latch.nextStart(dueAbs) - absNowMs();
+      if (wait > 0.2 && wait < 40) {
+        latch.stats.waits++;
+        latch.stats.waitMs += wait;
+        Atomics.wait(sleeper, 0, 0, wait);
+      }
+    }
     let mask = 0;
     for (const [from, to, m] of presses) if (f >= from && f < to) mask |= m;
-    if (live) mask |= Atomics.load(live, 0);
+    if (live) mask |= takeInputMask(live, 0);
     Module._shim_set_input(0, mask);
-    for (let p = 1; p < 4; p++) Module._shim_set_input(p, live ? Atomics.load(live, p) : 0);
+    for (let p = 1; p < 4; p++) Module._shim_set_input(p, live ? takeInputMask(live, p) : 0);
+    const vbBefore = vbI32 ? Atomics.load(vbI32, 8) : -1;
+    firstPostAt = 0;
+    barrierAt = 0;
+    const startAbs = tracking ? absNowMs() : 0;
     const t0 = performance.now();
     try {
       Module._shim_run_frame();
@@ -250,14 +314,21 @@ async function runBoard() {
       return;
     }
     runMs += performance.now() - t0;
+    if (latch) latch.update({ preMs: barrierAt > 0 ? barrierAt - startAbs : NaN, lateMs: dueAbs > 0 ? readSeatLate(pace, msg.seat) : NaN });
+    if (trace) traceWrite(trace, [f + 1, startAbs, absNowMs(), firstPostAt, mask, vbBefore, dueAbs, latch ? latch.leadMs : -1, barrierAt]);
     if (present) postFrame(f + 1);
     if (cardWatch && (f + 1) % 30 === 0) cardWatch.poll();
     Atomics.store(frameCounts, msg.index, f + 1);
     Atomics.notify(frameCounts, msg.index);
     const n = f + 1;
-    for (let k = 0; k < WATCH.length; k++) {
-      const v = Module._shim_dbg_ram_word(WATCH[k][1] & 0x1ffffff) >>> 0;
-      if (v !== prev[k]) { prev[k] = v; changes.push([n, WATCH[k][0], v, vbI32 ? Atomics.load(vbI32, 8) : null]); }
+    for (let k = 0; k < watch.length; k++) {
+      const v = Module._shim_dbg_ram_word(watch[k][1] & 0x1ffffff) >>> 0;
+      if (v !== prev[k]) { prev[k] = v; changes.push([n, watch[k][0], v, vbI32 ? Atomics.load(vbI32, 8) : null]); }
+    }
+    if (msg.netWatch) {
+      const wd = Module._shim_dbg_ram_word(WD_COUNT & 0x1ffffff) >>> 0;
+      if (wd > wdMax) wdMax = wd;
+      if (n % 60 === 0) { if (wdMax > 1) changes.push([n, 'wd_max', wdMax, vbI32 ? Atomics.load(vbI32, 8) : null]); wdMax = 0; }
     }
     if (changes.length && (n % 60 === 0 || changes.length > 200)) { post('watch', { changes }); changes = []; }
     if (n <= msg.frames && (n % msg.hashEvery === 0 || n === msg.frames)) {

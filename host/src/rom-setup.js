@@ -22,24 +22,27 @@
 // to run the game without the check.
 
 import { ROM_DIR_NAME, checkRomName } from './rom-store.js';
+import { BUILDABLE, EDITION_REGISTRY, isEditionId, setupFileFor } from './editions.js';
 
 export const SETUP_FILE = 'doc-setup.json';
 const HEX64 = /^[0-9a-f]{64}$/;
 
-// Editions this build of the game can run. Edition A is the stock Rev C
-// set as stored. Edition B ("Rev C Rebalanced", doc-ops D-072) is built in
-// the player's browser from that same stock set (edition-b.js), so a device
-// set up for A can run B too; the build itself refuses any file that is not
-// the stock set. Editions never mix (D-059, D-062).
-export const BUILDABLE_EDITIONS = Object.freeze(['A', 'B']);
+// Editions this build of the game can run (editions.js BUILDABLE: A and B
+// today). Edition A is the stock Rev C set as stored. Edition B ("Rev C
+// Rebalanced", doc-ops D-072) is built in the player's browser from that
+// same stock set (edition-b.js), so a device set up for A can run B too;
+// the build itself refuses any file that is not the stock set. Editions
+// never mix (D-059, D-062).
+export const BUILDABLE_EDITIONS = BUILDABLE;
 
-// The editions a device's stored game file can run. B is only ever built
-// in this browser from the stock set (D-072: never from a prebuilt B file),
-// so a record that holds the stock set (A) runs both, and any other record
-// runs neither.
+// The editions a device's stored game file can run: each buildable edition
+// whose files group (editions.js filesFrom) the record lists. B is only
+// ever built in this browser from the stock set (D-072: never from a
+// prebuilt B file), so a record that holds the stock set (A) runs A and B,
+// and a record that lists only B runs neither.
 export function deviceEditions(setup) {
   const own = setup && Array.isArray(setup.editions) ? setup.editions : [];
-  return own.includes('A') ? ['A', 'B'] : [];
+  return EDITION_REGISTRY.filter((e) => e.buildable && own.includes(e.filesFrom)).map((e) => e.id);
 }
 
 // The edition this page runs for a hand-off: the hand-off's edition when
@@ -62,7 +65,7 @@ export function parseSetup(raw) {
     files.push({ name: f.name, role: f.role, sha256: f.sha256, size: f.size });
   }
   if (files.filter((f) => f.role === 'game').length !== 1) return null;
-  const editions = r.editions.filter((e) => e === 'A' || e === 'B');
+  const editions = r.editions.filter(isEditionId);
   if (!editions.length) return null;
   return { files, editions };
 }
@@ -96,13 +99,17 @@ function defaultGetRoot() {
  * the game refuses to start (see the header). The pilot needs a non-empty
  * flag `rom` list.
  */
-export async function verifySetup({ getRoot = defaultGetRoot, subtle, expected = [] } = {}) {
+export async function verifySetup({ getRoot = defaultGetRoot, subtle, expected = [], edition = 'A' } = {}) {
+  // The record of the files group this edition runs from (editions.js
+  // setupFileFor): SETUP_FILE ("doc-setup.json") for Rev C, A and B, as before.
+  const recordName = setupFileFor(edition);
+  if (!recordName) return { ok: false, reason: 'missing' };
   let dir;
   try { dir = await (await getRoot()).getDirectoryHandle(ROM_DIR_NAME, { create: false }); } catch { dir = null; }
   if (!dir) return { ok: false, reason: 'missing' };
   let setup = null;
   try {
-    const f = await (await dir.getFileHandle(SETUP_FILE)).getFile();
+    const f = await (await dir.getFileHandle(recordName)).getFile();
     setup = parseSetup(await f.text());
   } catch { setup = null; }
   if (!setup) return { ok: false, reason: 'missing' };

@@ -214,7 +214,7 @@ Log "source HEAD: $GitHead (modified paths: $GitDirty)"
 $Sysroot     = Join-Path $EmscriptenDir 'cache\sysroot'
 $ZlibInclude = Join-Path $Sysroot 'include'
 $ZlibLibrary = Join-Path $Sysroot 'lib\wasm32-emscripten\libz.a'
-if (-not $DryRun -and -not (Test-Path -LiteralPath $ZlibLibrary)) {
+if (-not $DryRun -and -not $CheckOnly -and -not (Test-Path -LiteralPath $ZlibLibrary)) {
     $c = Invoke-Logged (Join-Path $EmscriptenDir 'embuilder.bat') @('build', 'zlib')
     if ($c -ne 0) { Fail "embuilder build zlib failed ($c)" }
 }
@@ -313,11 +313,17 @@ if ($Banned.Count -gt 0) { Log ('EXCLUDED: library contains excluded objects: ' 
 $prov['library_members'] = $Members.Count
 
 # GPL-3 check: every file the build compiled or included (ninja -t deps, plus the
-# sources named in build.ninja) is read, and the build fails if one carries GPL
-# version 3 terms that do not also allow version 2: an SPDX expression naming
-# GPL-3 but no GPL-2, or "version 3" licence-header text. picoTCP (GPL-2.0 OR
-# GPL-3.0) passes, because it allows version 2. Licence notices are read from
-# the first 6000 characters of each file.
+# sources named in build.ninja) is read, and the build fails if one carries a
+# common GPL version 3 notice that does not also allow version 2:
+#   SPDX: any AND term (or the whole expression) naming GPL-3 or LGPL-3 without
+#         also naming GPL-2 (so "GPL-3.0-only AND GPL-2.0-or-later" fails);
+#   text: a version 3 notice (GPLv3, GPL version 3, version 3 or later, either
+#         version 3 of the License, ...) in a header that does not also offer
+#         version 2. Comment characters and line breaks are collapsed first, so
+#         a notice wrapped across lines is still found.
+# picoTCP (GPL-2.0 OR GPL-3.0, LICENSE.GPLv2 and LICENSE.GPLv3) passes, because
+# it allows version 2. Licence notices are read from the first 6000 characters
+# of each file. A listed file that is missing fails the check too.
 $prevEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
 $DepsOut = @(& $NinjaExe -C $BuildDir -t deps 2>$null)
 $ErrorActionPreference = $prevEap
@@ -335,19 +341,26 @@ foreach ($l in (Get-Content -LiteralPath (Join-Path $BuildDir 'build.ninja'))) {
         [void]$DepFiles.Add($src)
     }
 }
-$Gpl3Text = '(?i)either version 3 of the License|version 3 of the GNU General Public License|GNU General Public License v3|GPLv3\+'
+$Gpl3Text = '(?i)either version 3 of the License|version 3 of the (GNU )?(Lesser |Library )?General Public License|GNU (Lesser |Library )?General Public License,? v(ersion)? ?3|\bL?GPL ?v(ersion)? ?3|version 3 or later|version 3,? or \(?at your option'
+$Gpl2Text = '(?i)\bGPL ?v(ersion)? ?2|(?<!L)GPL-2\.0|version 2 of the License|General Public License,? v(ersion)? ?2|either version 2'
 $Gpl3Hits = New-Object System.Collections.Generic.List[string]
 $Unread = 0
 foreach ($f in $DepFiles) {
     if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { $Unread++; continue }
     $text = [System.IO.File]::ReadAllText($f)
     $head = $text.Substring(0, [Math]::Min(6000, $text.Length))
+    $norm = $head -replace '[\s*/#;!]+', ' '
     $why = $null
     foreach ($m in [regex]::Matches($text, 'SPDX-License-Identifier:\s*([^\r\n*]+)')) {
         $expr = $m.Groups[1].Value
-        if ($expr -match '(?i)GPL-3' -and $expr -notmatch '(?i)GPL-2') { $why = "SPDX $($expr.Trim())" }
+        foreach ($term in [regex]::Split($expr, '(?i)\s+AND\s+')) {
+            if ($term -match '(?i)GPL-3' -and $term -notmatch '(?i)(?<!L)GPL-2') { $why = "SPDX $($expr.Trim())" }
+        }
     }
-    if ($null -eq $why -and $head -match $Gpl3Text) { $why = "header text '$($Matches[0])'" }
+    if ($null -eq $why -and $norm -match $Gpl3Text) {
+        $hit = $Matches[0]
+        if ($norm -notmatch $Gpl2Text) { $why = "header text '$hit'" }
+    }
     if ($null -ne $why) { $Gpl3Hits.Add("$f ($why)") }
 }
 $prov['licence_scan_files'] = $DepFiles.Count
@@ -355,6 +368,7 @@ $prov['licence_scan_unreadable'] = $Unread
 $prov['licence_scan_stale_deps'] = $StaleDeps
 $prov['licence_scan_gpl3'] = @($Gpl3Hits)
 Log "licence scan: $($DepFiles.Count) files from build.ninja and ninja -t deps, $Unread missing, $StaleDeps stale deps entries, $($Gpl3Hits.Count) GPL-3"
+if ($Unread -gt 0) { $prov.result = 'licence scan: listed files missing'; Save-Prov; Fail "licence scan: $Unread listed files are missing; rebuild before the licence scan" }
 if ($StaleDeps -gt 0) { $prov.result = 'stale ninja deps'; Save-Prov; Fail 'ninja -t deps has stale entries; rebuild before the licence scan' }
 foreach ($h in $Gpl3Hits) { Log "GPL-3: $h" }
 if ($Banned.Count -gt 0 -or $Gpl3Hits.Count -gt 0) {

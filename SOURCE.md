@@ -116,8 +116,8 @@ board) and `<ExtRoot>\build-wasm\link-out-linkbus2\flycast_libretro.{js,wasm}`
 `-DUSE_BUNDLED_GAME_DATA=OFF`, and patch 0023 turns `USE_ISOFS` off by default
 in this build (section 8). After building, `build-win.ps1` refuses the library
 if it holds an xBRZ, libcdio, ISO 9660 reader or `achievements.cpp` object, or
-if any file in `build.ninja` or `ninja -t deps` carries GPL version 3 terms
-that do not also allow version 2. `-CheckOnly` runs only these checks on an
+if any file in `build.ninja` or `ninja -t deps` carries a common GPL version 3
+notice (SPDX or licence-header text) that does not also allow version 2. `-CheckOnly` runs only these checks on an
 existing build folder.
 
 ## 5. Getting the same bytes
